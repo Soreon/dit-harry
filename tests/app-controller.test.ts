@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createLocalDb } from '../src/lib/db';
 import { AppError } from '../src/lib/errors';
 import { AppController } from '../src/lib/app.svelte';
+import { KV_LOCK_CONFIG, hashPassphrase } from '../src/lib/lock';
+import { createSimulatedAuthenticator } from '../src/lib/mock/passkey';
 import type {
   AuthService,
   AuthState,
@@ -31,6 +33,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -462,6 +465,114 @@ describe('AppController', () => {
     await app.signOut(false);
     expect(authCalls).toEqual(['signOut']);
     expect((await db.listEntries()).map((e) => e.id)).toEqual(['e1']);
+    app.destroy();
+  });
+
+  it('verrou : verrouillée dès la construction (drapeau) ; effacer l’appareil lève le verrou', async () => {
+    const { services, db } = makeServices();
+    const stored = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => stored.get(k) ?? null,
+      setItem: (k: string, v: string) => void stored.set(k, v),
+      removeItem: (k: string) => void stored.delete(k),
+    });
+    await db.putEntry(textEntry('e1'));
+    await db.setKv(KV_LOCK_CONFIG, {
+      enabled: true,
+      passphrase: await hashPassphrase('phrase de test', { iterations: 10 }),
+      delaySec: 60,
+      createdAt: '2026-10-08T08:00:00.000Z',
+    });
+    stored.set('dh.lock.enabled.test', '1');
+
+    const app = new AppController(services, {
+      authenticator: createSimulatedAuthenticator({ delayMs: 0 }),
+      lockFlagKey: 'dh.lock.enabled.test',
+    });
+    // Avant tout chargement : l'écran de verrouillage sera le premier rendu
+    expect(app.lock.locked).toBe(true);
+    await app.start();
+    // Le verrou n'empêche ni le chargement des données ni la synchro
+    expect(app.ready).toBe(true);
+    expect(app.entries.map((e) => e.id)).toEqual(['e1']);
+    expect(app.lock.enabled).toBe(true);
+    expect(app.lock.locked).toBe(true);
+
+    expect(await app.lock.unlockWithPassphrase('phrase de test')).toBe(true);
+    await app.signOut(true);
+    expect(app.lock.enabled).toBe(false);
+    expect(app.lock.locked).toBe(false);
+    expect(await db.getKv(KV_LOCK_CONFIG)).toBeUndefined();
+    expect(stored.has('dh.lock.enabled.test')).toBe(false);
+    app.destroy();
+  });
+
+  it('verrou : les notifications arrivées pendant le verrouillage attendent le déverrouillage', async () => {
+    const { services, db } = makeServices();
+    const stored = new Map<string, string>([['dh.lock.enabled.test', '1']]);
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => stored.get(k) ?? null,
+      setItem: (k: string, v: string) => void stored.set(k, v),
+      removeItem: (k: string) => void stored.delete(k),
+    });
+    await db.setKv(KV_LOCK_CONFIG, {
+      enabled: true,
+      passphrase: await hashPassphrase('phrase de test', { iterations: 10 }),
+      delaySec: 60,
+      createdAt: '2026-10-08T08:00:00.000Z',
+    });
+    // Seules les minuteries des notifications sont simulées (IndexedDB simulée : setImmediate).
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const app = new AppController(services, {
+      authenticator: createSimulatedAuthenticator({ delayMs: 0 }),
+      lockFlagKey: 'dh.lock.enabled.test',
+    });
+    expect(app.lock.locked).toBe(true);
+    app.toast('Enregistrement arrêté automatiquement — il est bien gardé.', 'info');
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(app.toasts.map((t) => t.message)).toEqual(['Enregistrement arrêté automatiquement — il est bien gardé.']);
+
+    await app.lock.load();
+    expect(await app.lock.unlockWithPassphrase('phrase de test')).toBe(true);
+    vi.advanceTimersByTime(3_000);
+    expect(app.toasts).toHaveLength(1);
+    vi.advanceTimersByTime(600);
+    expect(app.toasts).toHaveLength(0);
+
+    // Déverrouillée : minuterie habituelle
+    app.toast('Entrée enregistrée.', 'success');
+    vi.advanceTimersByTime(3_600);
+    expect(app.toasts).toHaveLength(0);
+  });
+
+  it('effacer l’appareil : la clé d’accès du verrou est signalée comme inutile', async () => {
+    const { services, db } = makeServices();
+    const stored = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => stored.get(k) ?? null,
+      setItem: (k: string, v: string) => void stored.set(k, v),
+      removeItem: (k: string) => void stored.delete(k),
+    });
+    await db.setKv(KV_LOCK_CONFIG, {
+      enabled: true,
+      passphrase: await hashPassphrase('phrase de test', { iterations: 10 }),
+      credentialId: 'AQIDBA',
+      publicKeySpki: 'AQIDBA==',
+      alg: -7,
+      rpId: 'soreon.github.io',
+      delaySec: 60,
+      createdAt: '2026-10-08T08:00:00.000Z',
+    });
+    stored.set('dh.lock.enabled.test', '1');
+    const authenticator = createSimulatedAuthenticator({ delayMs: 0 });
+    const forget = vi.spyOn(authenticator, 'forget');
+    const app = new AppController(services, { authenticator, lockFlagKey: 'dh.lock.enabled.test' });
+    await app.start();
+    expect(app.lock.config?.credentialId).toBe('AQIDBA');
+    expect(await app.lock.unlockWithPassphrase('phrase de test')).toBe(true);
+    await app.signOut(true);
+    expect(app.lock.enabled).toBe(false);
+    expect(forget).toHaveBeenCalledWith('soreon.github.io', 'AQIDBA');
     app.destroy();
   });
 

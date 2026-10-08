@@ -7,8 +7,9 @@
   import { formatRelative, plural } from './helpers';
   import Icon from './Icon.svelte';
   import KeyField from './KeyField.svelte';
+  import LockSettings from './LockSettings.svelte';
 
-  // Réglages : compte, Gemini, sauvegarde, synchronisation, application, à propos.
+  // Réglages : compte, Gemini, sauvegarde, synchronisation, verrouillage, application, à propos.
   const app = useApp();
   const uid = $props.id();
 
@@ -267,6 +268,9 @@
       {/if}
     </button>
   </section>
+
+  <!-- Verrouillage (empreinte / phrase de secours), propre à cet appareil -->
+  <LockSettings />
 
   <!-- Application (installation sur l'écran d'accueil) -->
   <section class="card group" aria-labelledby="{uid}-app">

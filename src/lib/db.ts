@@ -8,6 +8,7 @@
  *   kv        (clé libre)
  */
 import { AppError } from './errors';
+import { lockFlagKey } from './lock';
 import type { DayKey, LocalDb, LocalEntry, LocalSynthesis, RecordingChunk } from './types';
 import { byCreatedDesc } from './util';
 
@@ -247,11 +248,18 @@ export function createLocalDb(name: string = 'dit-harry'): LocalDb {
     setKv: <T>(key: string, value: T) => putOne('kv', value, key),
     deleteKv: (key) => deleteOne('kv', key),
 
-    clearAll() {
-      return tx(ALL_STORES, 'readwrite', (t) => {
+    async clearAll() {
+      await tx(ALL_STORES, 'readwrite', (t) => {
         for (const s of ALL_STORES) t.objectStore(s).clear();
         return () => undefined;
       });
+      // Le verrou (kv `lock.config`) vient d'être effacé : son drapeau synchrone aussi, sinon
+      // l'écran de verrouillage s'afficherait au démarrage sans configuration.
+      try {
+        if (typeof localStorage !== 'undefined') localStorage.removeItem(lockFlagKey(name));
+      } catch {
+        // stockage bloqué : le drapeau orphelin est effacé à la lecture de la configuration
+      }
     },
   };
 }

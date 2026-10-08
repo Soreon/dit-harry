@@ -23,7 +23,9 @@
     | 'sparkle'
     | 'external'
     | 'people'
-    | 'pin';
+    | 'pin'
+    | 'lock'
+    | 'fingerprint';
 </script>
 
 <script lang="ts">
@@ -120,6 +122,18 @@
   {:else if name === 'pin'}
     <path d="M12 21s-6.5-6-6.5-11a6.5 6.5 0 0 1 13 0c0 5-6.5 11-6.5 11z" />
     <circle cx="12" cy="10" r="2.5" />
+  {:else if name === 'lock'}
+    <rect x="5" y="10.5" width="14" height="10" rx="2.5" />
+    <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3" />
+    <path d="M12 14.5v2.2" />
+  {:else if name === 'fingerprint'}
+    <path d="M4.8 9.6A7.6 7.6 0 0 1 17.3 6.4" />
+    <path d="M19.3 9.8c.2.6.3 1.2.3 1.8v1c0 1.9-.2 3.7-.7 5.4" />
+    <path d="M6.3 17.2c.4-1.4.6-2.9.6-4.4v-1.2a5.1 5.1 0 0 1 8.6-3.7" />
+    <path d="M16.9 10.4c.1.4.2.8.2 1.2v1.2c0 2.6-.4 5-1.3 7.2" />
+    <path d="M9.4 11.6a2.6 2.6 0 0 1 5.2 0v1.2c0 3-.6 5.8-1.8 8.2" />
+    <path d="M12 12.4v.4c0 2.6-.5 5.1-1.5 7.4" />
+    <path d="M9.3 15.5c-.2 1.6-.6 3.1-1.3 4.5" />
   {/if}
 </svg>
 

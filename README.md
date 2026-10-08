@@ -22,6 +22,10 @@ dans **mon** Google Drive, l'IA de **Google Gemini** avec **ma** clé.
 - **Sauvegarde** double : copie Markdown automatique et lisible dans un dossier Drive
   « Dit Harry », et export zip à la demande.
 - **Audio conservé 365 jours** (réglable), puis supprimé automatiquement ; le texte reste.
+- **Verrouillage** facultatif par **empreinte** (clé d'accès du téléphone, vérifiée sans
+  serveur) avec une **phrase de secours** : l'appli se verrouille après un délai hors de l'appli
+  (immédiat, 1, 5 ou 15 min) ou 5 min sans toucher l'écran, jamais pendant un enregistrement
+  ni pendant l'écoute d'une entrée (l'écoute se met en pause au verrouillage).
 - Thèmes clair et sombre ; aucun rappel ni notification.
 
 ## Comment ça marche
@@ -86,6 +90,13 @@ dans **mon** Google Drive, l'IA de **Google Gemini** avec **ma** clé.
 - **Connexion Google** : jeton d'accès valable 1 h, gardé en mémoire de session, jamais écrit
   dans le Drive ni dans IndexedDB. Pas de jeton de rafraîchissement (pas de serveur) : après
   une heure, l'appli propose « Se reconnecter ».
+- **Verrouillage** : il protège l'affichage contre quelqu'un qui tient le téléphone déverrouillé.
+  Ce n'est pas un chiffrement : la copie Markdown du Drive reste lisible, et les données locales
+  restent accessibles aux outils de développement. Le code du téléphone ouvre aussi l'appli (il
+  remplace l'empreinte), et qui tient le téléphone peut effacer les données du site puis se
+  reconnecter à Google pour retrouver le journal. Sa configuration (clé publique, empreinte
+  PBKDF2 de la phrase de secours) reste sur le téléphone, jamais dans le Drive. Détails dans
+  [docs/SETUP.md](docs/SETUP.md) (étape 8).
 
 ## Développement
 
@@ -121,6 +132,8 @@ déposées sur des jours passés : leurs synthèses se génèrent toutes seules.
   « clé manquante » s'affiche, comme en vrai.
 - Le vrai micro est utilisé s'il est disponible, sinon un enregistrement simulé (silence)
   prend le relais.
+- Le verrouillage fonctionne avec une empreinte simulée (« Déverrouiller (démo) », reconnue en
+  une demi-seconde) ; la phrase de secours est la vraie.
 - Pour repartir de zéro : DevTools → Application → Storage → « Clear site data ».
 
 ### Déploiement
@@ -142,6 +155,8 @@ src/
   lib/
     types.ts, errors.ts, util.ts   contrat partagé, erreurs, utilitaires
     app.svelte.ts                  contrôleur réactif de l'interface
+    lock.ts, lock.svelte.ts        verrouillage (empreinte WebAuthn, phrase de secours)
+    passkey.ts                     clé d'accès : navigator.credentials (ou simulée en démo)
     db.ts, settings.ts             IndexedDB, réglages
     sync.ts                        moteur de synchronisation
     auth.ts, drive.ts              Google Identity Services, Drive REST v3

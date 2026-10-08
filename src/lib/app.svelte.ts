@@ -9,6 +9,9 @@ import { buildExportZip, downloadBlob } from './backup';
 import { updateEntry, updateKv, withEntryLock, withKvLock } from './db';
 import { toAppError } from './errors';
 import { promptInstall } from './install.svelte';
+import { LockController } from './lock.svelte';
+import { isMediaPlaying, type PasskeyAuthenticator } from './lock';
+import { createWebAuthnAuthenticator } from './passkey';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings as storeSettings } from './settings';
 import { KV_DEVICE_OWNER, hasLocalJournal, pendingCountOf } from './sync';
 import type {
@@ -66,6 +69,13 @@ export interface UnsavedRecording {
   downloaded: boolean;
 }
 
+/** Dépendances du verrou fournies au démarrage (App.svelte : réelles ou démo ; tests : simulées). */
+export interface AppControllerOptions {
+  authenticator?: PasskeyAuthenticator;
+  /** Drapeau localStorage du verrou propre à la base locale (voir lock.ts, `lockFlagKey`). */
+  lockFlagKey?: string;
+}
+
 const IDLE_SYNC: SyncStatus = {
   running: false,
   phase: 'idle',
@@ -89,6 +99,11 @@ function writeLocal(key: string, value: string | null): void {
   } catch {
     // stockage indisponible (navigation privée…) : préférence non mémorisée
   }
+}
+
+/** Une entrée est en cours d'écoute (lecteur audio de l'écran Entrée). */
+function mediaPlaying(): boolean {
+  return typeof document !== 'undefined' && isMediaPlaying(document);
 }
 
 /** Liste de chaînes lue dans `kv` (valeur quelconque → tableau propre). */
@@ -117,6 +132,8 @@ function withFreshAnalysis(local: EntryLocalState, dirty: boolean): EntryLocalSt
 
 export class AppController {
   readonly services: Services;
+  /** Verrouillage de l'appli (empreinte / phrase de secours). Voir lock.svelte.ts. */
+  readonly lock: LockController;
 
   /* --- État réactif ------------------------------------------------ */
   route = $state.raw<Route>(parseRoute(location.hash));
@@ -188,12 +205,24 @@ export class AppController {
   private reloading: Promise<void> | null = null;
   private reloadAgain = false;
   private toastSeq = 0;
+  /** Notifications arrivées pendant le verrouillage (minuterie pas encore lancée). */
+  private heldToasts: { id: number; ms: number }[] = [];
   private previousHash = '';
 
-  constructor(services: Services) {
+  constructor(services: Services, opts: AppControllerOptions = {}) {
     this.services = services;
     this.auth = services.auth.getState();
     this.syncStatus = services.sync.getStatus();
+    // Construit ici (synchrone) : l'écran de verrouillage est décidé avant le premier rendu.
+    this.lock = new LockController({
+      db: services.db,
+      authenticator: opts.authenticator ?? createWebAuthnAuthenticator(),
+      flagKey: opts.lockFlagKey,
+      // Jamais de verrouillage pour inactivité pendant un enregistrement ni pendant l'écoute d'une
+      // entrée (aucun appui pendant qu'on écoute).
+      isBusy: () => this.recording.status !== 'idle' || mediaPlaying(),
+      onUnlock: () => this.releaseHeldToasts(),
+    });
   }
 
   /* ================================================================== */
@@ -206,6 +235,7 @@ export class AppController {
     const { auth, sync, db } = this.services;
 
     this.disposers.push(
+      this.lock.start(),
       auth.subscribe((s) => this.onAuthChange(s)),
       sync.subscribe((s) => {
         this.syncStatus = s;
@@ -473,8 +503,11 @@ export class AppController {
   private async clearDeviceData(): Promise<void> {
     try {
       await this.services.db.clearAll();
+      // Le verrou faisait partie des données de l'appareil ; sa clé d'accès ne sert plus.
+      this.lock.forgetAndReset();
     } catch (e) {
       this.toast(toAppError(e).message, 'error');
+      await this.lock.load();
     }
     this.releaseAudio();
     writeLocal(LS_KEY_LATER, null);
@@ -1026,7 +1059,16 @@ export class AppController {
   toast(message: string, kind: Toast['kind'] = 'info', ms?: number): void {
     const id = ++this.toastSeq;
     this.toasts = [...this.toasts, { id, message, kind }].slice(-3);
-    setTimeout(() => this.dismissToast(id), ms ?? (kind === 'error' ? 6500 : 3500));
+    const delay = ms ?? (kind === 'error' ? 6500 : 3500);
+    // Verrouillée : les notifications sont cachées ; leur minuterie part au déverrouillage, pour
+    // qu'elles ne disparaissent pas sans avoir été vues (ex. enregistrement arrêté).
+    if (this.lock.locked) this.heldToasts.push({ id, ms: delay });
+    else setTimeout(() => this.dismissToast(id), delay);
+  }
+
+  /** Déverrouillage : les notifications arrivées pendant le verrouillage s'affichent pour de bon. */
+  private releaseHeldToasts(): void {
+    for (const { id, ms } of this.heldToasts.splice(0)) setTimeout(() => this.dismissToast(id), ms);
   }
 
   dismissToast(id: number): void {

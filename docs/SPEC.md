@@ -28,6 +28,7 @@ facultatif `SyncStatus.accountConflict` (garde-fou de compte Google, §8 étape 
 | Confidentialité Gemini | offre gratuite acceptée par l'utilisateur |
 | Plateforme | Android / Chrome uniquement (iOS non ciblé) |
 | Langue | interface et contenus **en français** |
+| Verrouillage | facultatif : empreinte (clé d'accès de plateforme) + phrase de secours obligatoire, propre à l'appareil, délai 1 min par défaut (§15) |
 
 ## 2. Architecture & propriété des fichiers
 
@@ -45,6 +46,9 @@ src/
     app.svelte.ts      UI            contrôleur réactif (runes) utilisé par les composants
     install.svelte.ts  UI            installation PWA : beforeinstallprompt, état réactif
     install.ts         UI            installation PWA : règles de décision pures
+    lock.ts            UI            verrou : règles pures, WebAuthn (vérification locale), PBKDF2
+    lock.svelte.ts     UI            verrou : état réactif, verrouillage automatique, cérémonies
+    passkey.ts         UI            verrou : accès à navigator.credentials (réel ou démo)
     db.ts              CORE          IndexedDB (createLocalDb)
     settings.ts        CORE          réglages : défauts, chargement, sauvegarde, fusion
     sync.ts            CORE          moteur de synchronisation (createSyncEngine)
@@ -57,7 +61,7 @@ src/
     zip.ts             MEDIA         écriture zip « store » (createZip)
     backup.ts          MEDIA         export zip manuel (buildExportZip, downloadBlob)
     services.ts        (figé)        createServices() : réel ou mock
-    mock/*.ts          INFRA         auth / drive / gemini / recorder simulés
+    mock/*.ts          INFRA         auth / drive / gemini / recorder / clé d'accès simulés
 public/
   sw.js, manifest.webmanifest, icons/*        INFRA
   screenshots/*.png                           INFRA  captures du manifeste (mode démo)
@@ -154,6 +158,15 @@ export function createServices(): Promise<Services>;
 
 // mock/index.ts (INFRA)
 export function createMockServices(): Promise<Services>;
+
+// lock.ts / lock.svelte.ts / passkey.ts (verrou, §15)
+export function verifyAssertion(a: PasskeyAssertion, x: AssertionExpectations): Promise<AssertionCheck>;
+export function ecdsaDerToRaw(der: Uint8Array, size?: number): Uint8Array;
+export function hashPassphrase(p: string, opts?: { iterations?: number; salt?: Uint8Array }): Promise<PassphraseHash>;
+export function verifyPassphrase(p: string, stored: PassphraseHash): Promise<boolean>;
+export class LockController { constructor(deps: LockDeps); /* … */ }
+export function createLockEnvironment(): Promise<{ authenticator: PasskeyAuthenticator; flagKey: string }>;
+// app.svelte.ts : new AppController(services, { authenticator?, lockFlagKey? }) → `app.lock`
 ```
 
 ## 3. Stockage
@@ -195,9 +208,14 @@ Clés `kv` réservées :
 | `mirror.state` | `{ rootId?: string; yearIds: Record<string,string>; days: Record<DayKey,{fileId:string; sig:string}> }` | sync.ts |
 | `sync.synthesisBackoff` | `Record<DayKey,{sig; attempts; retryAfter}>` (interne) | sync.ts |
 | `device.ownerEmail` | email du compte Google à qui appartiennent les données de l'appareil (posé au premier cycle connecté d'un appareil vierge ; effacé par `clearAll`) | sync.ts + contrôleur |
+| `lock.config` | `LockConfig` du verrou (§15) — propre à l'appareil, **jamais** envoyé à Drive | lock.svelte.ts |
+| `lock.attempts` | `{ failures, retryAt }` : phrases de secours fausses (survit au redémarrage) | lock.svelte.ts |
 
 L'auth persiste dans `localStorage` (`dh.auth.email`, `dh.auth.name`) et le jeton dans
 `sessionStorage` (`dh.auth.token` = `{token, expiresAt}`) — jamais dans IndexedDB.
+Le verrou pose `dh.lock.enabled = '1'` dans `localStorage` (lu de façon synchrone au démarrage ;
+`dh.lock.enabled.<base>` pour une autre base que `dit-harry`, ex. la démo) ; `clearAll()` le
+retire avec la base.
 
 `navigator.storage.persist()` est demandé au démarrage (contrôleur).
 
@@ -414,6 +432,11 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 - Lecture audio : blob local sinon `drive.downloadBlob(audioFileId)` → `URL.createObjectURL`
   (cache mémoire, révoqué à la sortie de l'écran).
 - Le bouton « Se reconnecter » appelle `auth.signIn()` **directement** dans `onclick`.
+- Verrou (§15) : `app.lock` (`LockController`) est construit avec le contrôleur (drapeau lu tout
+  de suite), démarré en premier dans `start()` ; l'inactivité ne verrouille jamais pendant un
+  enregistrement ni pendant la lecture d'un `<audio>` (`isBusy`). Effacement des données de
+  l'appareil → `lock.forgetAndReset()` (relecture si l'effacement a échoué). `toast()` pendant le
+  verrouillage : minuterie mise en attente, lancée au déverrouillage (`onUnlock`).
 
 ## 10. Interface
 
@@ -455,8 +478,9 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 - **Réglages** : compte (email, Se déconnecter, option « Effacer les données de cet appareil »),
   clé Gemini (masquée, Vérifier), modèles d'entrée/synthèse, copie visible Drive (on/off),
   conservation audio (jours), Exporter (zip), Synchroniser maintenant + dernier cycle,
-  Application (« Dit Harry est installée sur cet appareil. », sinon bouton « Installer sur l'écran
-  d'accueil », sinon mode d'emploi du menu ⋮ de Chrome), version.
+  Verrouillage (§15), Application (« Dit Harry est installée sur cet appareil. », sinon bouton
+  « Installer sur l'écran d'accueil », sinon mode d'emploi du menu ⋮ de Chrome), version.
+- **Écran de verrouillage** (§15) : plein écran opaque au-dessus de tout (z-index 100).
 - **Bandeau d'état** (haut) : hors ligne ; session expirée + « Se reconnecter » ; clé manquante ;
   synchro en cours / N en attente.
 - Humeur → emoji : -2 😞, -1 🙁, 0 😐, 1 🙂, 2 😄.
@@ -494,8 +518,11 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 `services.ts` fournit des mocks : auth (connexion instantanée, email `demo@exemple.fr`),
 Drive persisté dans une base IndexedDB séparée `dit-harry-mock-drive`, Gemini simulé
 (latence ~800 ms, analyse déterministe dérivée du texte, transcription factice pour l'audio),
-enregistreur réel si micro disponible sinon simulé (blob silencieux + niveau oscillant). Les
-mocks sont importés dynamiquement pour ne pas alourdir le build de production.
+enregistreur réel si micro disponible sinon simulé (blob silencieux + niveau oscillant), clé
+d'accès simulée pour le verrou (`mock/passkey.ts` : vraie paire ECDSA P-256 WebCrypto, clé
+privée dans `localStorage` `dh.mock.passkeys`, signature DER, « doigt reconnu » en ~500 ms ;
+boutons libellés « (démo) »). Les mocks sont importés dynamiquement pour ne pas alourdir le build
+de production.
 
 ## 13. Sécurité
 
@@ -503,10 +530,111 @@ mocks sont importés dynamiquement pour ne pas alourdir le build de production.
 - Aucun secret dans le dépôt. La clé Gemini est saisie par l'utilisateur, stockée en local
   (IndexedDB `kv.settings`) et dans `settings.json` (appDataFolder, lisible par l'appli seule).
 - Dépendances d'exécution : **svelte uniquement**. Appels Google/Gemini en `fetch` natif.
+- Verrou de l'appli (§15) : barrière d'interface contre l'accès occasionnel au téléphone
+  déverrouillé, **pas un chiffrement**.
 
 ## 14. Tests
 
 Vitest (`tests/*.test.ts`, environnement node + `fake-indexeddb/auto` via `tests/setup.ts`).
 Chaque module non-UI a ses tests : db, settings, sync (avec faux Drive/IA en mémoire), drive et
 gemini (avec `fetchImpl` simulé), prompts/normalisation, recorder (`pickRecordingMimeType`),
-markdown, zip (relecture des en-têtes + CRC), backup.
+markdown, zip (relecture des en-têtes + CRC), backup, verrou (`lock.test.ts` : clés générées
+par la WebCrypto de Node, signatures DER construites à partir des signatures brutes, assertions
+refusées pour défi / origine / domaine / drapeaux / signature ; `lock-controller.test.ts` :
+authentificateur simulé, horloge et visibilité simulées).
+
+## 15. Verrouillage (lock.ts, lock.svelte.ts, passkey.ts)
+
+**Modèle de menace** : quelqu'un qui tient le téléphone déverrouillé (accès occasionnel). Le
+verrou est une **barrière d'interface** ; les données ne sont pas chiffrées (IndexedDB, Drive).
+Aucun serveur : la clé d'accès est vérifiée localement. **Hors de portée** (documenté dans
+SETUP §8) : qui connaît le code du téléphone (`userVerification: 'required'` l'accepte à la
+place de l'empreinte ; WebAuthn n'a pas d'option « biométrie seule ») ; qui efface les données
+du site `soreon.github.io` puis se reconnecte au compte Google du téléphone (journal complet
+rapatrié de Drive, audio compris).
+
+- **Déverrouillage** : clé d'accès WebAuthn **de plateforme** (empreinte, visage ou code du
+  téléphone), ou **phrase de secours** obligatoire.
+- **Stockage, propre à l'appareil** (jamais dans Drive) : kv `lock.config` =
+  `{ enabled, credentialId? (base64url), publicKeySpki? (base64, getPublicKey()), alg? (-7 | -257),
+  rpId?, passphrase: { salt, hash, iterations }, delaySec, createdAt }` + drapeau `localStorage`
+  `dh.lock.enabled` lu **de façon synchrone** à la construction du contrôleur : l'écran de
+  verrouillage est dans le premier rendu de `Shell`, avant tout contenu du journal. Drapeau sans
+  configuration valide → déverrouillé et drapeau retiré ; configuration sans drapeau → verrouillé
+  à la lecture et drapeau rétabli ; lecture impossible avec drapeau → reste verrouillé
+  (« Réessayer »). L'état déverrouillé ne vit qu'en mémoire : rechargement ou démarrage à froid =
+  verrouillé. `db.clearAll()` retire aussi le drapeau ; le contrôleur appelle ensuite
+  `lock.forgetAndReset()` : plus de verrou, et la clé d'accès devenue inutile est signalée au
+  gestionnaire de mots de passe (sinon une seconde « Dit Harry — verrou » s'ajouterait à la
+  prochaine activation).
+- **Phrase de secours** : 6 caractères au moins (après `trim()` et normalisation NFC), saisie
+  deux fois ; PBKDF2-SHA256, 600 000 itérations (enregistrées avec l'empreinte ; injectables dans
+  les tests), sel aléatoire de 16 octets, 32 octets. 5 essais libres puis attente de 30 s,
+  doublée à chaque échec (plafond 30 min), conservée dans kv `lock.attempts` ; même compteur pour
+  les vérifications des réglages. Un succès (phrase ou empreinte) remet le compteur à zéro.
+- **Activation** (Réglages › Verrouillage › « Activer le verrouillage ») : disponibilité vérifiée
+  d'abord (`isUserVerifyingPlatformAuthenticatorAvailable()`), puis phrase ×2 → « Continuer » :
+  `navigator.credentials.create()` part **dans le gestionnaire de l'envoi** (geste de
+  l'utilisateur), PBKDF2 calculé pendant ce temps. Options : `rp { id: location.hostname, name:
+  'Dit Harry' }`, `user { id: 16 octets aléatoires, name: 'Dit Harry — verrou', displayName: 'Dit
+  Harry (verrou)' }`, défi de 32 octets, `pubKeyCredParams` ES256 puis RS256,
+  `authenticatorSelection { authenticatorAttachment: 'platform', residentKey: 'preferred',
+  userVerification: 'required' }`, `attestation: 'none'`, `hints: ['client-device']`, 60 s.
+  Indisponible, annulée ou en échec → explication + « Activer avec la phrase seule » (et
+  « Réessayer l'empreinte » après un échec).
+- **Vérification de l'assertion** (`verifyAssertion`, WebCrypto) : `rawId` = clé enregistrée ;
+  `clientDataJSON.type === 'webauthn.get'`, `challenge` = défi généré (base64url),
+  `origin === location.origin`, pas `crossOrigin` ; `authenticatorData` : `rpIdHash ===
+  SHA-256(rpId)`, drapeaux UP (0x01) **et** UV (0x04) ; signature sur
+  `authenticatorData ‖ SHA-256(clientDataJSON)` avec la SPKI : ES256 → DER converti en r‖s
+  (P1363) pour ECDSA P-256/SHA-256 ; RS256 → RSASSA-PKCS1-v1_5/SHA-256.
+- **Écran de verrouillage** (`LockScreen.svelte`) : opaque, au-dessus de tout ; l'appli reste
+  montée derrière, `inert` + `aria-hidden` (saisie, enregistrement et synchro intacts) ; toasts
+  non rendus, et ceux émis pendant le verrouillage gardent leur minuterie en attente jusqu'au
+  déverrouillage (`onUnlock`) : ils ne disparaissent pas sans avoir été vus ; dialogues modaux
+  ouverts fermés au verrouillage (la couche supérieure passerait au-dessus et rendrait le bouton
+  inerte), focus retiré ; **audio et vidéo mis en pause** (`pauseAllMedia`) et toute reprise
+  bloquée tant que l'écran est là (écouteur `play` en capture : `inert` n'arrête ni le bouton du
+  casque ni les commandes multimédia d'Android). Logo, « Dit Harry est verrouillée »,
+  « Déverrouiller » (+ « (démo) »), « Utiliser ma phrase de secours » → champ + « Déverrouiller »,
+  avertissement si un enregistrement continue. Après trop d'essais : la zone `aria-live` annonce
+  une fois l'attente imposée (texte fixe) ; le décompte, qui change chaque seconde, est sur le
+  bouton désactivé (« Réessaie dans 28 s »), hors de cette zone. Le message d'erreur est retiré
+  pendant chaque calcul : une même erreur répétée est de nouveau annoncée.
+  `config.rpId !== location.hostname` (ex. clé créée en local) ou WebAuthn absent → phrase seule,
+  avec une phrase d'explication. Focus sur le titre à l'apparition ; au déverrouillage, sur le
+  `<h1>` de l'écran courant.
+- **Lancement automatique** de la clé d'accès, une fois par apparition de l'écran (démarrage à
+  froid, retour au premier plan), page visible **et** active (`document.hasFocus()`, sinon au
+  premier `focus`) ; échec silencieux (ex. activation exigée) : le bouton reste. Pas de
+  lancement après « Verrouiller maintenant » ni après l'inactivité (`lock()` le désarme, comme
+  le déverrouillage et un appui sur « Déverrouiller »). Jamais réarmé pendant une cérémonie, ni
+  au retour d'une page cachée pendant une cérémonie (code du téléphone en plein écran) : une
+  demande annulée ne se rouvre pas d'elle-même, en boucle.
+- **Verrouillage automatique** : `visibilitychange` caché → `hiddenAt` (délai « Immédiat » :
+  verrouillage tout de suite, pour la vignette des applis récentes, au mieux) ; visible →
+  verrouillé si `now - hiddenAt >= delaySec` (horloge murale ; recul d'horloge > 1 min →
+  verrouillé). Premier plan sans appui, touche, molette ni défilement pendant 5 min → verrouillé,
+  **jamais pendant un enregistrement ni pendant l'écoute d'une entrée** (statut ≠ `idle` ou
+  `<audio>` en lecture : le compte repart). Le verrou n'arrête jamais un enregistrement ni une
+  synchro. Délais : Immédiat (0), 1 minute (60, défaut), 5 minutes, 15 minutes.
+- **Cérémonie WebAuthn en cours** (fenêtre système, qui peut cacher la page) : ni inactivité, ni
+  verrouillage immédiat au passage en arrière-plan ; `hiddenAt` est noté, la décision est
+  reportée. Fin de la cérémonie (`endCeremony`) : réussie → la personne est là, l'absence est
+  oubliée ; échouée ou annulée avec la page **toujours cachée** → vrai départ (Accueil, appel,
+  écran éteint) : « Immédiat » verrouille aussitôt, sinon le retour décide. Retour pendant une
+  cérémonie : une absence de plus de 2 min (2 × le délai WebAuthn) verrouille quand même
+  (cérémonie bloquée).
+- **Réglages, verrou actif** : état (« Empreinte et phrase de secours » / « Phrase de secours
+  seule »), délai, « Verrouiller maintenant », « Changer la phrase de secours », « Réenregistrer
+  l'empreinte » (« Ajouter l'empreinte » en phrase seule), « Désactiver le verrouillage ». Les
+  trois dernières exigent une **vérification fraîche** (empreinte ou phrase actuelle, valable
+  2 min, annulée au verrouillage) contrôlée par `LockController` lui-même : chaque `lock()`
+  change une époque ; une vérification, un changement de phrase ou un réenregistrement commencé
+  avant ne vaut plus à son terme (rien n'est enregistré, la clé créée pour rien est signalée), et
+  aucune de ces actions n'est possible verrouillée. Confirmation expirée en cours de route
+  (étape « nouvelle phrase » ou « enregistrer l'empreinte ») → elle est redemandée, champs saisis
+  gardés, puis l'action reprend (la création d'une clé d'accès exige un nouvel appui).
+  Réenregistrement et désactivation signalent l'ancienne clé au gestionnaire de mots de passe
+  (`PublicKeyCredential.signalUnknownCredential`, si disponible).
+- **Démo** : authentificateur simulé injecté (`createLockEnvironment()`), voir §12.

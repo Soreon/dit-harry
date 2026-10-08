@@ -194,7 +194,73 @@ Au bout de 2 à 3 minutes, l'appli est en ligne sur **`https://soreon.github.io/
 Mises à jour : après un déploiement, l'appli se met à jour d'elle-même à l'ouverture suivante
 (au besoin, la fermer complètement puis la rouvrir).
 
-## 8. Développement sur l'ordinateur
+## 8. Verrouiller l'appli avec ton empreinte (facultatif)
+
+Dit Harry peut demander ton empreinte (ou ton visage, ou le code de verrouillage du téléphone)
+à chaque ouverture. Rien à configurer côté Google ni GitHub : tout se passe sur le téléphone.
+
+1. Dans l'appli installée : **Réglages** → **Verrouillage** → **Activer le verrouillage**.
+2. Choisis une **phrase de secours** (6 caractères au moins), tape-la deux fois → **Continuer**.
+   Note-la dans un endroit sûr, hors du téléphone. Elle sert quand l'empreinte ne marche pas.
+3. Le téléphone propose de créer une **clé d'accès** « Dit Harry — verrou » : accepte et pose
+   ton doigt. Elle est rangée dans le Gestionnaire de mots de passe de Google.
+   - Si le téléphone ne le propose pas (aucun verrouillage d'écran configuré) ou si tu annules,
+     l'appli propose **Activer avec la phrase seule** : il faudra alors la taper à chaque fois.
+     **Ajouter l'empreinte** reste possible plus tard dans les réglages.
+4. Choisis **Verrouiller après** : **Immédiat**, **1 minute** (par défaut), **5 minutes** ou
+   **15 minutes** passées hors de l'appli. Ouverte, elle se verrouille aussi après 5 minutes sans
+   toucher l'écran, jamais pendant un enregistrement ni pendant l'écoute d'une entrée.
+
+Au retour dans l'appli, la demande d'empreinte s'affiche d'elle-même ; sinon touche
+**Déverrouiller**. **Utiliser ma phrase de secours** est toujours proposé. Après 5 phrases
+fausses, il faut attendre 30 s, puis deux fois plus à chaque nouvelle erreur.
+
+Dans les réglages : **Verrouiller maintenant**, **Changer la phrase de secours**,
+**Réenregistrer l'empreinte** (par exemple après avoir supprimé la clé d'accès du Gestionnaire
+de mots de passe) et **Désactiver le verrouillage**. Ces trois dernières actions demandent
+d'abord ton empreinte ou ta phrase actuelle ; cette confirmation vaut 2 minutes (au-delà,
+l'appli la redemande sans effacer ce que tu as tapé) et tombe si l'appli se verrouille.
+
+**Ce que le verrou protège** : le journal affiché par l'appli, contre quelqu'un qui tient ton
+téléphone déverrouillé (enfant, ami, téléphone prêté) **sans en connaître le code**. Un
+enregistrement ou une synchronisation en cours continuent derrière l'écran de verrouillage ;
+une entrée en cours d'écoute, elle, se met en pause. Les notifications arrivées pendant le
+verrouillage t'attendent jusqu'au déverrouillage.
+
+**Ce qu'il ne protège pas** :
+
+- **qui connaît le code de ton téléphone** (schéma, code PIN, mot de passe) : la demande
+  d'empreinte accepte aussi ce code (« Utiliser le verrouillage de l'écran »), et Android ne
+  permet pas d'exiger l'empreinte seule ;
+- **qui tient ton téléphone et efface les données du site** : Chrome → Paramètres des sites →
+  `soreon.github.io` → Effacer (le chemin de secours décrit plus bas) retire le verrou ; il
+  suffit ensuite de se reconnecter à Google, déjà connu du téléphone, pour retrouver tout le
+  journal depuis Drive, audio compris. Là, ce qui protège vraiment, c'est ton compte Google
+  et le verrouillage de ton téléphone ;
+- c'est une barrière d'affichage, pas un chiffrement : les données restent lisibles sur le
+  téléphone (IndexedDB) pour qui y accède avec des outils de développement (débogage USB
+  activé, ordinateur branché) ;
+- la **copie lisible** en Markdown dans `Mon Drive/Dit Harry/`, visible par quiconque ouvre ton
+  Google Drive (application Drive du téléphone comprise) ;
+- les **autres sites** de `soreon.github.io` (même origine, même stockage : voir l'étape 1) ;
+- les **captures d'écran** et la vignette des **applis récentes** : avec un délai d'une minute ou
+  plus, la vignette montre l'écran tel que tu l'as quitté. Choisis **Immédiat** pour que l'appli
+  se verrouille dès qu'elle passe en arrière-plan (au mieux : Android peut prendre la vignette
+  juste avant).
+
+Le verrou est propre à **ce téléphone** : il n'est pas envoyé dans Drive. Sur un autre appareil,
+active-le de nouveau. Effacer les données de l'appareil (déconnexion avec effacement) le retire,
+et la clé d'accès « Dit Harry — verrou », devenue inutile, est signalée au Gestionnaire de mots
+de passe (qui la retire quand Chrome le permet).
+
+**Empreinte ET phrase de secours perdues ?** Il faut effacer les données de l'appli sur ce
+téléphone : Chrome **⋮** → **Paramètres** → **Paramètres des sites** → **Toutes les données des
+sites** → `soreon.github.io` → **Effacer**. Attention : cela efface aussi les données locales des
+autres sites de `soreon.github.io` (yt-dashboard), même origine. Rouvre ensuite Dit Harry et
+reconnecte-toi : le journal revient de Drive ; seules les entrées pas encore envoyées sont
+perdues.
+
+## 9. Développement sur l'ordinateur
 
 ```sh
 npm install
@@ -215,8 +281,10 @@ npm run dev           # http://localhost:5173
   l'étape 3.6). Si Vite annonce un autre port, c'est que 5173 est occupé : arrête l'autre
   serveur. Utilise `localhost`, pas `127.0.0.1`.
 - Le mode démo et le vrai mode utilisent des bases locales différentes : pas de mélange.
+- En local, une clé d'accès créée pour `localhost` ne sert pas sur `soreon.github.io` (et
+  inversement) : l'écran de verrouillage propose alors la phrase de secours seule.
 
-## 9. En cas de problème
+## 10. En cas de problème
 
 **Le menu ⋮ de Chrome dit « Cette appli est déjà installée » puis « Impossible d'ouvrir
 l'application », alors qu'elle ne l'est pas.**
@@ -276,6 +344,12 @@ Tu t'es connecté avec un autre compte Google que celui dont le journal est sur 
 La synchronisation est en pause pour ne pas mélanger les deux : **Annuler** pour revenir au
 premier compte, ou **Effacer les données de cet appareil** pour continuer avec le nouveau (ce qui
 est déjà dans le Drive du premier compte y reste).
+
+**L'empreinte ne déverrouille plus Dit Harry (« Empreinte non vérifiée »).**
+La clé d'accès « Dit Harry — verrou » a peut-être été supprimée du Gestionnaire de mots de
+passe de Google, ou le verrouillage d'écran du téléphone a été réinitialisé. Touche **Utiliser ma
+phrase de secours**, puis **Réglages** → **Verrouillage** → **Réenregistrer l'empreinte**. Les
+deux perdus : voir l'étape 8.
 
 **Le déploiement échoue à l'étape « Configurer Pages ».**
 GitHub Pages n'est pas réglé sur **GitHub Actions** (étape 2).
