@@ -30,7 +30,10 @@
     </li>
     <li>
       <span class="bullet" aria-hidden="true"><Icon name="book" size={20} /></span>
-      <span>Tout reste dans ton Google Drive, rien ailleurs.</span>
+      <span>
+        Ton journal est rangé dans ton Google Drive ; Gemini, l'IA de Google, le transcrit et
+        l'analyse avec ta propre clé.
+      </span>
     </li>
   </ul>
 
@@ -43,6 +46,15 @@
     {:else}
       {#if app.auth.status === 'error' && app.auth.error}
         <p class="notice notice-error" role="alert">{app.auth.error}</p>
+      {/if}
+      {#if app.deviceOwner}
+        <p class="notice">
+          <Icon name="user" size={18} />
+          <span>
+            Ce téléphone garde le journal de <strong class="owner">{app.deviceOwner}</strong> :
+            connecte-toi avec ce compte pour le retrouver.
+          </span>
+        </p>
       {/if}
       <button type="button" class="btn btn-primary btn-block big" disabled={busy} onclick={() => app.signIn()}>
         {#if busy}
@@ -149,5 +161,9 @@
     font-size: 0.875rem;
     color: var(--ink-muted);
     text-align: center;
+  }
+
+  .owner {
+    overflow-wrap: anywhere;
   }
 </style>

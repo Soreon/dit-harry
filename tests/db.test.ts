@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createLocalDb, updateKv, withKvLock } from '../src/lib/db';
+import { createLocalDb, updateEntry, updateKv, withEntryLock, withKvLock } from '../src/lib/db';
 import type { LocalEntry, LocalSynthesis, RecordingChunk } from '../src/lib/types';
 
 function freshDb(): { name: string; db: ReturnType<typeof createLocalDb> } {
@@ -182,5 +182,31 @@ describe('updateKv / withKvLock', () => {
     await expect(withKvLock(db, () => Promise.reject(new Error('boum')))).rejects.toThrow('boum');
     expect(await updateKv(db, 'n', (cur) => (typeof cur === 'number' ? cur : 0) + 1)).toBe(1);
     expect(await db.getKv('n')).toBe(1);
+  });
+});
+
+describe('updateEntry / withEntryLock', () => {
+  it('modifications concurrentes d’une entrée : aucune écriture perdue', async () => {
+    const { db } = freshDb();
+    await db.putEntry({ ...entry('e', '2026-10-08', '2026-10-08T08:00:00.000Z'), transcript: '' });
+    // Section lente (comme la synchro : lecture, attente, écriture) pendant d'autres modifications
+    const slow = withEntryLock(db, async () => {
+      const cur = await db.getEntry('e');
+      await new Promise((r) => setTimeout(r, 20));
+      if (cur) await db.putEntry({ ...cur, transcript: `${cur.transcript}S` });
+    });
+    const edits = ['a', 'b', 'c'].map((v) => updateEntry(db, 'e', (cur) => ({ ...cur, transcript: cur.transcript + v })));
+    await Promise.all([slow, ...edits]);
+    expect((await db.getEntry('e'))?.transcript).toBe('Sabc');
+  });
+
+  it('updateEntry : entrée absente ou fn → null : rien n’est écrit', async () => {
+    const { db } = freshDb();
+    expect(await updateEntry(db, 'absente', (cur) => cur)).toBeUndefined();
+    await db.putEntry(entry('e', '2026-10-08', '2026-10-08T08:00:00.000Z'));
+    expect(await updateEntry(db, 'e', () => null)).toBeUndefined();
+    expect((await db.getEntry('e'))?.transcript).toBe('texte e');
+    await expect(withEntryLock(db, () => Promise.reject(new Error('boum')))).rejects.toThrow('boum');
+    expect((await updateEntry(db, 'e', (cur) => ({ ...cur, transcript: 'ok' })))?.transcript).toBe('ok');
   });
 });

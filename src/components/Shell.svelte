@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { provideApp, type AppController } from '../lib/app.svelte';
+  import { routeHash } from './helpers';
+  import AccountConflict from './AccountConflict.svelte';
   import Splash from './Splash.svelte';
   import Welcome from './Welcome.svelte';
   import KeySetup from './KeySetup.svelte';
@@ -19,6 +22,47 @@
   provideApp(app);
 
   const route = $derived(app.route);
+
+  /** Écran affiché : change → le focus passe au titre du nouvel écran (lecteurs d'écran). */
+  const screenKey = $derived(
+    !app.hasAccount
+      ? app.auth.status === 'loading'
+        ? 'splash'
+        : 'welcome'
+      : app.showAccountConflict
+        ? 'conflict'
+        : app.showKeySetup
+          ? 'key'
+          : routeHash(route),
+  );
+  let firstScreen = true;
+
+  $effect(() => {
+    void screenKey;
+    // Premier affichage : le navigateur place déjà la lecture en haut de la page.
+    if (firstScreen) {
+      firstScreen = false;
+      return;
+    }
+    void tick().then(focusScreenTitle);
+  });
+
+  /**
+   * Après un changement d'écran, l'élément activé (lien, carte…) a souvent disparu : sans cela,
+   * TalkBack repart d'une position imprévisible et le nouveau titre n'est pas annoncé.
+   */
+  function focusScreenTitle(): void {
+    if (document.querySelector('dialog[open]')) return;
+    const active = document.activeElement;
+    // Un écran qui a placé lui-même le focus dans un champ le garde.
+    if (active instanceof HTMLElement && active.isConnected && active.matches('input, textarea, select, [contenteditable="true"]')) {
+      return;
+    }
+    const title = document.querySelector<HTMLElement>('h1');
+    if (!title) return;
+    if (!title.hasAttribute('tabindex')) title.setAttribute('tabindex', '-1');
+    title.focus({ preventScroll: true });
+  }
 </script>
 
 {#if !app.hasAccount}
@@ -27,6 +71,8 @@
   {:else}
     <Welcome />
   {/if}
+{:else if app.showAccountConflict}
+  <AccountConflict />
 {:else if app.showKeySetup}
   <KeySetup />
 {:else}
@@ -53,7 +99,13 @@
   </div>
 {/if}
 
-<Toasts offset={!app.hasAccount || app.showKeySetup ? 'edge' : route.name === 'today' ? 'dock' : 'tabbar'} />
+<Toasts
+  offset={!app.hasAccount || app.showAccountConflict || app.showKeySetup
+    ? 'edge'
+    : route.name === 'today'
+      ? 'dock'
+      : 'tabbar'}
+/>
 
 <style>
   .app {
@@ -70,6 +122,11 @@
   }
 
   main:focus {
+    outline: none;
+  }
+
+  /* Titre d'écran focalisé par programme (pas un élément interactif) : pas d'anneau. */
+  :global(h1[tabindex='-1']:focus) {
     outline: none;
   }
 </style>

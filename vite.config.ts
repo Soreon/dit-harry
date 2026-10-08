@@ -40,7 +40,8 @@ function cspMeta(): Plugin {
 }
 
 // BASE_PATH est fourni par la GitHub Action (sortie de actions/configure-pages) :
-// "/" pour https://<org>.github.io/, "/<repo>/" pour un site de projet.
+// "/" pour un site à la racine (https://<compte>.github.io/), "/<repo>/" pour un site de projet
+// (ici https://soreon.github.io/dit-harry/ → "/dit-harry/").
 const base = process.env.BASE_PATH ? process.env.BASE_PATH.replace(/\/?$/, '/') : '/';
 
 export default defineConfig({

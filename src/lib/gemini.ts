@@ -37,13 +37,18 @@ const GENERATE_TIMEOUT_MS = 5 * 60_000;
 const CHECK_TIMEOUT_MS = 20_000;
 /** Délai avant nouvel essai quand le crédit prépayé est épuisé (402). */
 const CREDIT_RETRY_MS = 60 * 60_000;
+/** Quota journalier : remis à zéro à minuit, heure du Pacifique (doc « rate limits »). */
+const DAILY_QUOTA_TIME_ZONE = 'America/Los_Angeles';
+/** Marge après la remise à zéro avant de retenter. */
+const DAILY_RESET_MARGIN_MS = 5 * 60_000;
+const DAY_MS = 24 * 60 * 60_000;
 /** Titre d'une entrée texte vide (analysée sans appel à Gemini). */
 const EMPTY_TEXT_TITLE = 'Entrée vide';
 
 const MSG = {
   invalidKey: 'Clé Gemini refusée. Vérifie-la dans les réglages.',
   referrerBlocked:
-    "Clé Gemini refusée depuis ce site : autorise l'adresse de l'appli dans les restrictions de la clé.",
+    "Clé Gemini refusée depuis ce site : dans les restrictions de la clé, autorise l'origine du site suivie de « /* », sans le chemin de l'appli (le navigateur n'envoie que l'origine).",
   serviceDisabled: "L'API Gemini n'est pas activée pour le projet de cette clé.",
   quota: 'Quota Gemini atteint, nouvel essai plus tard.',
   credit: 'Crédit Gemini épuisé. Recharge-le dans AI Studio.',
@@ -140,11 +145,68 @@ function isKeyProblem(reason: string | undefined, message: string): boolean {
   return (reason?.startsWith('API_KEY_') ?? false) || /api key (not valid|expired|invalid)/i.test(message);
 }
 
+/**
+ * Clé limitée à certains sites. La page envoie `Referrer-Policy: strict-origin-when-cross-origin`
+ * (index.html, et défaut de Chrome) : Google ne reçoit que l'ORIGINE (ex.
+ * `https://soreon.github.io/`), jamais le chemin. Une restriction sur l'adresse complète de
+ * l'appli (`…/dit-harry/*`) ne correspond donc jamais : on indique la valeur qui marche.
+ */
+function referrerBlockedMessage(): string {
+  const origin = typeof location !== 'undefined' ? location.origin : '';
+  if (!origin || origin === 'null') return MSG.referrerBlocked;
+  return `Clé Gemini refusée depuis ce site : dans les restrictions de la clé, autorise « ${origin}/* » (le navigateur n'envoie que l'origine du site, sans le chemin de l'appli).`;
+}
+
 function keyError(reason: string | undefined, status: number, body: unknown): AppError {
   let message: string = MSG.invalidKey;
-  if (reason === 'API_KEY_HTTP_REFERRER_BLOCKED') message = MSG.referrerBlocked;
+  if (reason === 'API_KEY_HTTP_REFERRER_BLOCKED') message = referrerBlockedMessage();
   else if (reason === 'SERVICE_DISABLED') message = MSG.serviceDisabled;
   return new AppError('invalid-key', message, { retryable: false, status, cause: body });
+}
+
+/** `QuotaFailure.violations[].quotaId` (ex. 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'). */
+function quotaIds(body: unknown): string[] {
+  const ids: string[] = [];
+  for (const d of errorDetails(body)) {
+    if (d['@type'] !== 'type.googleapis.com/google.rpc.QuotaFailure') continue;
+    const violations = d['violations'];
+    if (!Array.isArray(violations)) continue;
+    for (const v of violations) {
+      if (isRecord(v) && typeof v['quotaId'] === 'string') ids.push(v['quotaId']);
+    }
+  }
+  return ids;
+}
+
+/** ms jusqu'au prochain minuit à Los Angeles (remise à zéro des quotas journaliers). */
+export function msUntilDailyQuotaReset(nowMs: number = Date.now()): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: DAILY_QUOTA_TIME_ZONE,
+      hourCycle: 'h23',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).formatToParts(new Date(nowMs));
+    const part = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? 0);
+    const elapsed = (((part('hour') % 24) * 60 + part('minute')) * 60 + part('second')) * 1000 + (nowMs % 1000);
+    // Jours de changement d'heure (23 h / 25 h) : au pire une heure d'écart, sans conséquence.
+    return Math.max(60_000, DAY_MS - elapsed);
+  } catch {
+    return CREDIT_RETRY_MS; // fuseaux horaires indisponibles : nouvel essai dans une heure
+  }
+}
+
+/** 429 d'un quota JOURNALIER : nouvel essai seulement après la remise à zéro. */
+function dailyQuotaError(status: number, body: unknown): AppError {
+  const nowMs = Date.now();
+  const retryAfterMs = msUntilDailyQuotaReset(nowMs) + DAILY_RESET_MARGIN_MS;
+  const hour = new Date(nowMs + retryAfterMs).getHours();
+  return new AppError('quota', `Quota quotidien Gemini atteint : reprise automatique vers ${hour} h.`, {
+    status,
+    retryAfterMs,
+    cause: body,
+  });
 }
 
 /** Extrait court (et sûr) du message de l'API, pour les erreurs inattendues. */
@@ -172,6 +234,8 @@ function httpError(status: number, body: unknown, model: string): AppError {
     return new AppError('quota', MSG.credit, { status, retryAfterMs: CREDIT_RETRY_MS, cause: body });
   }
   if (status === 429) {
+    // Quota du jour épuisé : le RetryInfo (quelques secondes) ne vaut que pour la minute en cours.
+    if (quotaIds(body).some((id) => /PerDay|Daily/i.test(id))) return dailyQuotaError(status, body);
     const retryAfterMs = retryDelayMs(body);
     return new AppError('quota', MSG.quota, {
       status,

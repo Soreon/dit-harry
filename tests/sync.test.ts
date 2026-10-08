@@ -15,7 +15,7 @@ vi.mock('../src/lib/markdown', () => ({
 }));
 
 import { AppError } from '../src/lib/errors';
-import { createLocalDb } from '../src/lib/db';
+import { createLocalDb, updateEntry } from '../src/lib/db';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings } from '../src/lib/settings';
 import { createSyncEngine, pendingCountOf } from '../src/lib/sync';
 import type {
@@ -259,6 +259,8 @@ const YESTERDAY_EVENING = new Date(2026, 9, 7, 21, 0, 0);
 async function bench(settings: Partial<Settings> = { geminiApiKey: 'CLE' }): Promise<Bench> {
   const db = createLocalDb(`test-sync-${crypto.randomUUID()}`);
   await db.setKv('settings', { ...DEFAULT_SETTINGS, ...settings });
+  // Données de l'appareil : celles du compte du faux Drive (voir FakeDrive.about).
+  await db.setKv('device.ownerEmail', 'moi@exemple.fr');
   const clock = { t: TODAY.getTime() };
   const now = () => new Date(clock.t);
   const drive = new FakeDrive(now);
@@ -569,7 +571,8 @@ describe('createSyncEngine', () => {
     expect(b.ai.textCalls).toEqual(['deux']);
     expect(b.ai.audioCalls).toEqual([]);
     const t2 = await getEntry(b.db, 't2');
-    expect(t2.local).toMatchObject({ attempts: 1, errorKind: 'quota' });
+    // Quota : délai seulement, pas de tentative comptée (les 5 essais auto restent intacts)
+    expect(t2.local).toMatchObject({ attempts: 0, errorKind: 'quota' });
     expect(t2.local.retryAfter).toBe(new Date(TODAY.getTime() + 120_000).toISOString());
     expect((await getEntry(b.db, 'v1')).local.attempts).toBe(0);
     expect(b.sync.getStatus()).toMatchObject({ lastErrorKind: 'quota', lastError: 'Quota Gemini atteint.' });
@@ -600,6 +603,92 @@ describe('createSyncEngine', () => {
     }
     expect(b.ai.textCalls).toHaveLength(5);
     expect((await getEntry(b.db, 't1')).local.attempts).toBe(5);
+  });
+
+  it('quota répété (ex. quota journalier) : les 5 essais automatiques ne sont pas consommés', async () => {
+    b.ai.fail = () => new AppError('quota', 'Quota quotidien Gemini atteint.', { retryAfterMs: 30_000 });
+    await b.db.putEntry(textEntry('q1', TODAY, 'beaucoup'));
+    for (let i = 0; i < 8; i++) {
+      await b.sync.run();
+      b.clock.t += HOUR;
+    }
+    expect(b.ai.textCalls).toHaveLength(8);
+    expect((await getEntry(b.db, 'q1')).local).toMatchObject({ attempts: 0, errorKind: 'quota', needsAnalysis: true });
+    // quota rétabli : l'analyse se fait toute seule
+    b.ai.fail = null;
+    await b.sync.run();
+    expect((await getEntry(b.db, 'q1')).analysis).toBeDefined();
+  });
+
+  it('correction pendant l’analyse : jamais écrasée par le résultat de l’analyse (verrou des entrées)', async () => {
+    await b.db.putEntry(textEntry('t3', TODAY, 'original'));
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    let started = false;
+    const analyze = b.ai.analyzeText.bind(b.ai);
+    b.ai.analyzeText = async (text: string) => {
+      started = true;
+      await gate;
+      return analyze(text);
+    };
+    const p = b.sync.run();
+    await vi.waitFor(() => expect(started).toBe(true));
+    // Comme le contrôleur (updateTranscript) : lecture-écriture sous le verrou des entrées,
+    // le résultat de l'analyse arrivant dans le même tick.
+    const correction = updateEntry(b.db, 't3', (e) => ({
+      ...e,
+      transcript: 'CORRECTION UTILISATEUR',
+      transcriptEdited: true,
+      updatedAt: new Date(b.clock.t + 1000).toISOString(),
+      local: { ...e.local, dirty: true, needsAnalysis: true, attempts: 0 },
+    }));
+    release();
+    await correction;
+    await p;
+    const e = await getEntry(b.db, 't3');
+    expect(e.transcript).toBe('CORRECTION UTILISATEUR');
+    // jamais l'analyse de l'ancien texte marquée comme faite
+    expect(e.local.needsAnalysis || e.analysis?.title === 'Titre CORRECTION UTILISATEUR').toBe(true);
+    expect(e.analysis?.title).not.toBe('Titre original');
+  });
+
+  it('entrée effacée localement pendant l’envoi de son fichier existant : le fichier n’est pas supprimé de Drive', async () => {
+    await b.db.putEntry(textEntry('t1', TODAY, 'intacte'));
+    await b.sync.run();
+    const t1 = await getEntry(b.db, 't1');
+    const fileId = t1.local.driveFileId ?? '';
+    expect(b.drive.files.has(fileId)).toBe(true);
+    await editLocally(b.db, 't1', { transcript: 'modifiée', updatedAt: new Date(TODAY.getTime() + HOUR).toISOString() });
+
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    b.drive.gate = (op) => (op === 'updateFileContent' ? gate : undefined);
+    const p = b.sync.run();
+    await vi.waitFor(() => expect(b.drive.calls.updateFileContent).toBe(1));
+    await b.db.clearAll(); // « Effacer les données de cet appareil » pendant l'envoi
+    release();
+    await p;
+
+    expect((await b.db.getKv<string[]>('sync.pendingDeletes')) ?? []).not.toContain(fileId);
+    expect(b.drive.files.has(fileId)).toBe(true);
+  });
+
+  it('entrée supprimée pendant la CRÉATION de son fichier : le nouveau fichier est mis en attente de suppression', async () => {
+    await b.db.putEntry(textEntry('t2', TODAY, 'nouvelle', { local: { dirty: true, needsAnalysis: false, hasLocalAudio: false, attempts: 0 } }));
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    b.drive.gate = (op) => (op === 'createAppDataFile' ? gate : undefined);
+    const p = b.sync.run();
+    await vi.waitFor(() => expect(b.drive.calls.createAppDataFile).toBe(1));
+    await b.db.deleteEntry('t2');
+    release();
+    await p;
+    // supprimé dans la foulée (synthèse/ménage ne relancent pas les suppressions) ou en attente
+    const created = b.drive.byName('entry-t2.json');
+    const pending = (await b.db.getKv<string[]>('sync.pendingDeletes')) ?? [];
+    expect(created === undefined || pending.includes(created.meta.id)).toBe(true);
+    await b.sync.run();
+    expect(b.drive.byName('entry-t2.json')).toBeUndefined();
   });
 
   it('jeton absent → needsAuth, aucune opération distante', async () => {
@@ -780,6 +869,19 @@ describe('createSyncEngine', () => {
       expect(b.drive.mirrorFile('2026-10-07')).toBeDefined();
     });
 
+    it('synthèse : un quota répété n’épuise pas les essais automatiques', async () => {
+      b.ai.fail = (op) => (op === 'synth' ? new AppError('quota', 'Quota.', { retryAfterMs: 60_000 }) : undefined);
+      await seedTwoDays();
+      for (let i = 0; i < 7; i++) {
+        await b.sync.run();
+        b.clock.t += 2 * 60_000;
+      }
+      expect(b.ai.synthCalls).toHaveLength(7);
+      b.ai.fail = null;
+      await b.sync.run();
+      expect(await b.db.getSynthesis('2026-10-07')).toBeDefined();
+    });
+
     it('erreur de synthèse : notée, pas de nouvel essai immédiat', async () => {
       b.ai.fail = (op) => (op === 'synth' ? new AppError('bad-response', 'Réponse illisible.', { retryable: true }) : undefined);
       await seedTwoDays();
@@ -827,6 +929,62 @@ describe('createSyncEngine', () => {
     await b.sync.run();
     expect(b.drive.files.has(old2.id)).toBe(false);
     expect(await b.db.getKv('sync.lastHousekeeping')).toBe('2026-10-09');
+  });
+
+  it('ménage : l’audio d’une entrée jamais transcrite est gardé (seule copie de son contenu)', async () => {
+    b = await bench({ geminiApiKey: 'CLE', audioRetentionDays: 7 });
+    b.ai.fail = (op) => (op === 'audio' ? new AppError('safety', 'Bloqué par les filtres.', { retryable: false }) : undefined);
+    await addVoice(b.db, voiceEntry('s1', TODAY), 'secret');
+    await b.sync.run();
+    let e = await getEntry(b.db, 's1');
+    const audioId = e.audioFileId ?? '';
+    expect(audioId).toBeTruthy();
+    expect(e.local).toMatchObject({ needsAnalysis: true, hasLocalAudio: true, errorKind: 'safety' });
+
+    // 8 jours plus tard (rétention 7 jours) : toujours pas transcrite → audio gardé partout
+    b.clock.t += 8 * DAY;
+    await b.sync.run();
+    e = await getEntry(b.db, 's1');
+    expect(e.audioExpired).toBeFalsy();
+    expect(e.audioFileId).toBe(audioId);
+    expect(b.drive.files.has(audioId)).toBe(true);
+    expect(await b.db.getAudio('s1')).toBeDefined();
+
+    // Pas de clé non plus : même règle (entrée en attente d'analyse)
+    await addVoice(b.db, voiceEntry('k1', new Date(b.clock.t)), 'sans clé');
+    await saveSettings(b.db, { geminiApiKey: '' });
+    await b.sync.run();
+    b.clock.t += 8 * DAY;
+    await b.sync.run();
+    expect((await getEntry(b.db, 'k1')).audioExpired).toBeFalsy();
+    expect(await b.db.getAudio('k1')).toBeDefined();
+
+    // Une fois transcrite (nouvel essai manuel), l'audio expire normalement au ménage suivant
+    await saveSettings(b.db, { geminiApiKey: 'CLE' });
+    b.ai.fail = null;
+    await b.sync.run({ force: true });
+    b.clock.t += DAY;
+    await b.sync.run();
+    e = await getEntry(b.db, 's1');
+    expect(e).toMatchObject({ audioFileId: null, audioExpired: true, transcript: 'Transcription de secret' });
+    expect(b.drive.files.has(audioId)).toBe(false);
+  });
+
+  it('ménage : audio d’une entrée inconnue ici → gardé tant que le pull est incomplet, supprimé si orphelin', async () => {
+    const old = new Date(2025, 8, 1, 9, 0);
+    const orphan = b.drive.seedAppData('audio-z1.webm', new Blob(['x']), { kind: 'audio', day: dayKey(old), entryId: 'z1' }, old.toISOString());
+    // Entrée présente dans Drive mais illisible : on ne sait pas si elle est transcrite.
+    const broken = b.drive.seedAppData('entry-z2.json', 'pas du JSON', { kind: 'entry', day: dayKey(old), entryId: 'z2' });
+    const z2Audio = b.drive.seedAppData('audio-z2.webm', new Blob(['y']), { kind: 'audio', day: dayKey(old), entryId: 'z2' }, old.toISOString());
+    await b.sync.run();
+    expect(b.drive.files.has(orphan.id)).toBe(true);
+    expect(b.drive.files.has(z2Audio.id)).toBe(true);
+    expect(await b.db.getKv('sync.lastHousekeeping')).toBeUndefined(); // ménage à refaire
+
+    b.drive.remove(broken.id);
+    await b.sync.run();
+    expect(b.drive.files.has(orphan.id)).toBe(false);
+    expect(b.drive.files.has(z2Audio.id)).toBe(false);
   });
 
   describe('miroir Markdown', () => {
@@ -964,5 +1122,172 @@ describe('createSyncEngine', () => {
     expect(await b.db.getKv('sync.pendingDeletes')).toEqual([]);
     expect(b.drive.byName('entry-v1.json')).toBeUndefined();
     expect(b.drive.byName('audio-v1.webm')).toBeUndefined();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Compte Google propriétaire des données de l'appareil                */
+/* ------------------------------------------------------------------ */
+
+describe('createSyncEngine — compte Google', () => {
+  class AccountDrive extends FakeDrive {
+    constructor(
+      clock: () => Date,
+      readonly email: string,
+    ) {
+      super(clock);
+    }
+
+    override async about() {
+      await super.about();
+      return { email: this.email, name: this.email };
+    }
+  }
+
+  /** Client Drive qui, comme le vrai, agit sur le compte du jeton courant. */
+  function routedDrive(drives: Record<string, FakeDrive>, token: () => string | null): DriveClient {
+    const pick = (): FakeDrive => {
+      const t = token();
+      const d = t ? drives[t] : undefined;
+      if (!d) throw new AppError('auth', 'Pas de jeton.');
+      return d;
+    };
+    return {
+      about: () => pick().about(),
+      listAppData: () => pick().listAppData(),
+      downloadJson<T>(id: string) {
+        return pick().downloadJson<T>(id);
+      },
+      downloadBlob: (id) => pick().downloadBlob(id),
+      createAppDataFile: (n, body, m, p) => pick().createAppDataFile(n, body, m, p),
+      updateFileContent: (id, body, m) => pick().updateFileContent(id, body, m),
+      deleteFile: (id) => pick().deleteFile(id),
+      ensureFolder: (n, p) => pick().ensureFolder(n, p),
+      upsertTextFile: (p, n, c, m, e) => pick().upsertTextFile(p, n, c, m, e),
+    };
+  }
+
+  async function twoAccounts() {
+    const db = createLocalDb(`test-sync-compte-${crypto.randomUUID()}`);
+    await db.setKv('settings', { ...DEFAULT_SETTINGS, geminiApiKey: 'CLE' });
+    const clock = { t: TODAY.getTime() };
+    const now = () => new Date(clock.t);
+    const driveA = new AccountDrive(now, 'moi@exemple.fr');
+    const driveB = new AccountDrive(now, 'travail@exemple.fr');
+    const auth = {
+      token: 'jeton-A' as string | null,
+      getToken: () => auth.token,
+      markExpired: vi.fn(() => {
+        auth.token = null;
+      }),
+    };
+    const ai = new FakeAi();
+    const drive = routedDrive({ 'jeton-A': driveA, 'jeton-B': driveB }, () => auth.token);
+    const sync = createSyncEngine({ db, drive, auth, createAi: () => ai, now, isOnline: () => true });
+    return { db, driveA, driveB, auth, ai, sync, clock };
+  }
+
+  it('appareil vierge : compte adopté ; autre compte → conflit, rien n’est envoyé, tiré ni supprimé', async () => {
+    const t = await twoAccounts();
+    await t.sync.run();
+    expect(await t.db.getKv('device.ownerEmail')).toBe('moi@exemple.fr');
+    for (const id of ['a1', 'a2', 'a3']) await t.db.putEntry(textEntry(id, TODAY, `texte ${id}`));
+    await t.sync.run();
+    expect(t.driveA.byName('entry-a1.json')).toBeDefined();
+
+    // Jeton expiré : a1 supprimée (suppression Drive en attente), a2 corrigée.
+    t.auth.token = null;
+    const a1 = await getEntry(t.db, 'a1');
+    await t.db.deleteEntry('a1');
+    await t.db.setKv('sync.pendingDeletes', [a1.local.driveFileId]);
+    await editLocally(t.db, 'a2', { transcript: 'deux corrigé', updatedAt: new Date(TODAY.getTime() + HOUR).toISOString() });
+
+    // Reconnexion… avec un autre compte Google.
+    t.auth.token = 'jeton-B';
+    await t.sync.run();
+    expect(t.sync.getStatus().accountConflict).toEqual({ owner: 'moi@exemple.fr', current: 'travail@exemple.fr' });
+    expect(t.driveB.files.size).toBe(0);
+    expect(Object.keys(t.driveB.calls)).toEqual(['about']);
+    expect((await t.db.listEntries()).map((e) => e.id).sort()).toEqual(['a2', 'a3']);
+    expect(await t.db.getKv('sync.pendingDeletes')).toEqual([a1.local.driveFileId]);
+    expect((await getEntry(t.db, 'a2')).local.dirty).toBe(true);
+    expect(t.auth.markExpired).not.toHaveBeenCalled();
+
+    // Le compte n'est vérifié qu'une fois par jeton.
+    await t.sync.run();
+    expect(t.driveB.calls.about).toBe(1);
+    expect(t.driveB.files.size).toBe(0);
+
+    // Retour au bon compte : la synchro reprend, rien n'a été perdu.
+    t.auth.token = 'jeton-A';
+    await t.sync.run();
+    expect(t.sync.getStatus().accountConflict).toBeUndefined();
+    expect(t.driveA.byName('entry-a1.json')).toBeUndefined();
+    expect(t.driveA.json<Entry>('entry-a2.json').transcript).toBe('deux corrigé');
+    expect(t.driveA.byName('entry-a3.json')).toBeDefined();
+    expect(await t.db.getKv('sync.pendingDeletes')).toEqual([]);
+  });
+
+  it('conflit : il disparaît avec le jeton (déconnexion)', async () => {
+    const t = await twoAccounts();
+    await t.sync.run();
+    t.auth.token = 'jeton-B';
+    await t.sync.run();
+    expect(t.sync.getStatus().accountConflict).toBeDefined();
+    t.auth.token = null;
+    await t.sync.run();
+    expect(t.sync.getStatus().accountConflict).toBeUndefined();
+  });
+
+  it('données locales sans propriétaire connu → conflit sans propriétaire ; une fois adoptées, synchro normale', async () => {
+    const t = await twoAccounts();
+    await t.db.putEntry(textEntry('x1', TODAY, 'ancien journal'));
+    await t.sync.run();
+    expect(t.sync.getStatus().accountConflict).toEqual({ current: 'moi@exemple.fr' });
+    expect(t.driveA.files.size).toBe(0);
+    expect(await t.db.getKv('device.ownerEmail')).toBeUndefined();
+
+    await t.db.setKv('device.ownerEmail', 'MOI@exemple.fr'); // « C'est mon journal » (casse ignorée)
+    await t.sync.run();
+    expect(t.sync.getStatus().accountConflict).toBeUndefined();
+    expect(t.driveA.byName('entry-x1.json')).toBeDefined();
+  });
+
+  it('jeton remplacé pendant le cycle par celui d’un autre compte : aucun appel Drive avec ce jeton', async () => {
+    const t = await twoAccounts();
+    await t.sync.run(); // adopte A
+    await t.db.putEntry(textEntry('n1', TODAY, 'nouvelle'));
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    let started = false;
+    const analyze = t.ai.analyzeText.bind(t.ai);
+    t.ai.analyzeText = async (text: string) => {
+      started = true;
+      await gate;
+      return analyze(text);
+    };
+    const p = t.sync.run();
+    await vi.waitFor(() => expect(started).toBe(true));
+    t.auth.token = 'jeton-B'; // reconnexion avec un autre compte pendant l'analyse
+    release();
+    await p;
+
+    expect(t.driveB.files.size).toBe(0);
+    expect(Object.keys(t.driveB.calls)).toEqual(['about']);
+    expect(t.sync.getStatus().accountConflict).toEqual({ owner: 'moi@exemple.fr', current: 'travail@exemple.fr' });
+    expect(t.auth.markExpired).not.toHaveBeenCalled();
+    const n1 = await getEntry(t.db, 'n1');
+    expect(n1.analysis).toBeDefined();
+    expect(n1.local.dirty).toBe(true);
+  });
+
+  it('Drive n’indique pas le compte → synchro distante suspendue (rien n’est supposé)', async () => {
+    const t = await twoAccounts();
+    vi.spyOn(t.driveA, 'about').mockResolvedValue({ email: '', name: '' });
+    await t.db.putEntry(textEntry('e1', TODAY, 'texte'));
+    await t.sync.run();
+    expect(t.driveA.files.size).toBe(0);
+    expect(t.sync.getStatus().lastError).toMatch(/n'a pas indiqué ton compte/);
+    expect(await t.db.getKv('device.ownerEmail')).toBeUndefined();
   });
 });

@@ -335,6 +335,17 @@ export type SyncPhase =
   | 'housekeeping'
   | 'mirroring';
 
+/**
+ * Le compte Google connecté n'est pas celui à qui appartiennent les données de cet appareil :
+ * la synchronisation Drive est suspendue jusqu'au choix de l'utilisateur.
+ */
+export interface AccountConflict {
+  /** Compte propriétaire des données locales ; absent s'il est inconnu (données plus anciennes). */
+  owner?: string;
+  /** Compte du jeton Google actuel. */
+  current: string;
+}
+
 export interface SyncStatus {
   running: boolean;
   phase: SyncPhase;
@@ -347,6 +358,8 @@ export interface SyncStatus {
   needsAuth: boolean;
   /** true si la clé Gemini manque ou est refusée. */
   needsKey: boolean;
+  /** Défini si le compte connecté n'est pas le propriétaire des données locales (Drive en pause). */
+  accountConflict?: AccountConflict;
 }
 
 export interface SyncEngine {

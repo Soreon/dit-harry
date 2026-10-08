@@ -21,6 +21,8 @@
   let confirmSignOut = $state(false);
   let clearDevice = $state(false);
   let syncing = $state(false);
+  /** Suppressions pas encore faites dans Drive (relu à l'ouverture du dialogue). */
+  let pendingDeletes = $state(0);
 
   const s = $derived(app.syncStatus);
   const defaultModels = $derived(
@@ -72,8 +74,16 @@
 
   function openSignOut(): void {
     clearDevice = false;
+    pendingDeletes = 0;
+    void app.countPendingDeletes().then((n) => (pendingDeletes = n));
     confirmSignOut = true;
   }
+
+  const signOutMessage = $derived(
+    clearDevice
+      ? 'Tes entrées restent dans ton Google Drive. Tu pourras te reconnecter à tout moment.'
+      : `Tes entrées restent dans ton Google Drive. Ton journal reste aussi sur ce téléphone, réservé à ${app.deviceOwner ?? app.auth.email ?? 'ce compte'} : pour utiliser un autre compte Google ici, il faudra d’abord effacer les données de cet appareil.`,
+  );
 </script>
 
 <section class="screen settings" aria-labelledby="settings-title">
@@ -106,7 +116,13 @@
       {#if app.needsReconnect}
         <button type="button" class="btn btn-primary" onclick={() => app.signIn()}>Se reconnecter</button>
       {/if}
-      <button type="button" class="btn btn-secondary" onclick={openSignOut}>Se déconnecter</button>
+      <button type="button" class="btn btn-secondary" disabled={app.signingOut} onclick={openSignOut}>
+        {#if app.signingOut}
+          <span class="spinner" aria-hidden="true"></span> Déconnexion…
+        {:else}
+          Se déconnecter
+        {/if}
+      </button>
     </div>
   </section>
 
@@ -194,6 +210,7 @@
       />
       <span class="field-help">
         Passé ce délai, l'audio est supprimé de ton Drive ; la transcription et l'analyse restent.
+        L'audio d'une entrée pas encore transcrite est gardé.
       </span>
     </div>
 
@@ -251,7 +268,7 @@
 <ConfirmDialog
   bind:open={confirmSignOut}
   title="Se déconnecter ?"
-  message="Tes entrées restent dans ton Google Drive. Tu pourras te reconnecter à tout moment."
+  message={signOutMessage}
   confirmLabel={clearDevice ? 'Déconnecter et effacer' : 'Se déconnecter'}
   danger={clearDevice}
   onconfirm={() => app.signOut(clearDevice)}
@@ -260,10 +277,23 @@
     <input type="checkbox" bind:checked={clearDevice} />
     <span>Effacer aussi les données de cet appareil</span>
   </label>
-  {#if clearDevice && app.pendingCount > 0}
+  {#if clearDevice && (app.pendingCount > 0 || pendingDeletes > 0)}
     <p class="notice notice-warning">
-      Attention : {plural(app.pendingCount, 'entrée n’est', 'entrées ne sont')} pas encore dans ton Drive.
-      {app.pendingCount > 1 ? 'Elles seront perdues.' : 'Elle sera perdue.'}
+      <span>
+        Attention :
+        {#if app.pendingCount > 0}
+          {plural(app.pendingCount, 'entrée n’est', 'entrées ne sont')} pas encore dans ton Drive.
+        {/if}
+        {#if pendingDeletes > 0}
+          Des suppressions faites ici ne sont pas encore appliquées dans ton Drive : les entrées
+          concernées y réapparaîtraient.
+        {/if}
+        {#if app.auth.status === 'signed-in' && app.online}
+          J’essaie d’abord de tout envoyer ; ce qui ne passe pas sera perdu.
+        {:else}
+          Reconnecte-toi d’abord pour tout envoyer, sinon ce sera perdu.
+        {/if}
+      </span>
     </p>
   {/if}
 </ConfirmDialog>
@@ -358,7 +388,8 @@
     height: 32px;
     margin: 0;
     border-radius: var(--radius-pill);
-    background: var(--line-strong);
+    /* Contraste ≥ 3:1 avec la carte (WCAG 1.4.11) : l'état « désactivé » reste lisible. */
+    background: var(--control-border);
     cursor: pointer;
     transition: background-color 0.2s ease;
   }

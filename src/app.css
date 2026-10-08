@@ -16,6 +16,9 @@
   --ink-faint: #8f8378;
   --line: #e4d9c9;
   --line-strong: #d3c5b1;
+  /* Bord des champs et piste d'interrupteur éteint : ≥ 3:1 sur --surface/--bg (WCAG 1.4.11).
+     --line-strong reste réservé aux bordures décoratives. */
+  --control-border: #9a8b78;
 
   /* Accent terracotta : --accent pour les grandes surfaces (bouton d'enregistrement),
      --accent-strong pour le texte et les boutons (contraste AA sur le papier). */
@@ -74,6 +77,7 @@
     --ink-faint: #8c8072;
     --line: #3a342c;
     --line-strong: #4d453a;
+    --control-border: #7d7262;
 
     --accent: #e07a5f;
     --accent-strong: #ec8c71;
@@ -443,7 +447,7 @@ button:disabled {
   width: 100%;
   min-height: 44px;
   padding: 10px 14px;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--ink);

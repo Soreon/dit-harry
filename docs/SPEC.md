@@ -10,6 +10,8 @@ Le contrat de types est dans [`src/lib/types.ts`](../src/lib/types.ts) ; les err
 assemblage dans [`src/lib/services.ts`](../src/lib/services.ts).
 **Ces 5 fichiers sont figés** : ne pas les modifier. Si un changement est indispensable, le
 signaler dans le compte rendu au lieu de l'appliquer.
+Seule évolution depuis (rétrocompatible) : `types.ts` ajoute `AccountConflict` et le champ
+facultatif `SyncStatus.accountConflict` (garde-fou de compte Google, §8 étape 0).
 
 ## 1. Décisions produit (validées par l'utilisateur)
 
@@ -67,6 +69,13 @@ tests/*.test.ts                               chaque équipe teste ses modules
 ```ts
 // db.ts
 export function createLocalDb(name?: string /* défaut 'dit-harry' */): LocalDb;
+// Lectures-modifications-écritures sérialisées (contrôleur ET synchro), jamais d'appel réseau
+// dedans. Seule imbrication permise : withEntryLock → withKvLock/updateKv (jamais l'inverse).
+export function withKvLock<T>(db: LocalDb, fn: () => Promise<T>): Promise<T>;
+export function updateKv<T>(db: LocalDb, key: string, fn: (current: unknown) => T): Promise<T>;
+export function withEntryLock<T>(db: LocalDb, fn: () => Promise<T>): Promise<T>;
+export function updateEntry(db: LocalDb, id: string,
+  fn: (cur: LocalEntry) => LocalEntry | null): Promise<LocalEntry | undefined>;
 
 // settings.ts
 export const DEFAULT_SETTINGS: Settings;               // updatedAt = '1970-01-01T00:00:00.000Z'
@@ -86,6 +95,9 @@ export interface SyncDeps {
 }
 export function createSyncEngine(deps: SyncDeps): SyncEngine;
 export function pendingCountOf(entries: LocalEntry[]): number;
+export const KV_DEVICE_OWNER: 'device.ownerEmail';
+/** Entrées, synthèses, suppressions en attente ou trace d'une synchro passée (réglages exclus). */
+export function hasLocalJournal(db: LocalDb): Promise<boolean>;
 
 // auth.ts
 export function createGoogleAuth(opts: { clientId: string; scopes: readonly string[] }): AuthService;
@@ -105,6 +117,8 @@ export function createGeminiClient(opts: {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
 }): AiClient;
+/** ms jusqu'au prochain minuit à Los Angeles (remise à zéro des quotas journaliers). */
+export function msUntilDailyQuotaReset(nowMs?: number): number;
 
 // prompts.ts
 export const ENTRY_AUDIO_PROMPT: string; export const ENTRY_TEXT_PROMPT: string;
@@ -176,6 +190,8 @@ Clés `kv` réservées :
 | `sync.forceSynthesisDays` | `DayKey[]` (synthèse demandée manuellement) | sync.ts + contrôleur |
 | `sync.lastHousekeeping` | DayKey | sync.ts |
 | `mirror.state` | `{ rootId?: string; yearIds: Record<string,string>; days: Record<DayKey,{fileId:string; sig:string}> }` | sync.ts |
+| `sync.synthesisBackoff` | `Record<DayKey,{sig; attempts; retryAfter}>` (interne) | sync.ts |
+| `device.ownerEmail` | email du compte Google à qui appartiennent les données de l'appareil (posé au premier cycle connecté d'un appareil vierge ; effacé par `clearAll`) | sync.ts + contrôleur |
 
 L'auth persiste dans `localStorage` (`dh.auth.email`, `dh.auth.name`) et le jeton dans
 `sessionStorage` (`dh.auth.token` = `{token, expiresAt}`) — jamais dans IndexedDB.
@@ -256,7 +272,11 @@ L'auth persiste dans `localStorage` (`dh.auth.email`, `dh.auth.name`) et le jeto
   `mood` neutre `{score:0,label:'neutre'}`), bornent le score, tronquent les chaînes trop longues,
   suppriment doublons et chaînes vides.
 - Erreurs : 400 `API_KEY_INVALID` / 401 / 403 → `invalid-key` (non retentable) ; 402 → `quota`
-  (« Crédit Gemini épuisé ») ; 429 → `quota` (retryAfterMs depuis `RetryInfo.retryDelay`) ;
+  (« Crédit Gemini épuisé ») ; 429 → `quota` (retryAfterMs depuis `RetryInfo.retryDelay`) —
+  sauf quota **journalier** (`QuotaFailure.violations[].quotaId` contenant `PerDay`/`Daily`) :
+  `retryAfterMs` = jusqu'au prochain minuit heure du Pacifique + 5 min, message « Quota quotidien
+  Gemini atteint : reprise automatique vers H h. » ; 403 `API_KEY_HTTP_REFERRER_BLOCKED` →
+  message qui indique l'ORIGINE à autoriser (« https://…/* » : le navigateur n'envoie pas le chemin) ;
   5xx → `network` ; `promptFeedback.blockReason` ou `finishReason` ∈ {SAFETY, PROHIBITED_CONTENT,
   BLOCKLIST, SPII, RECITATION} → `safety` (non retentable automatiquement) ; JSON illisible →
   `bad-response` (retentable) ; `TypeError` → `network`.
@@ -287,6 +307,15 @@ L'auth persiste dans `localStorage` (`dh.auth.email`, `dh.auth.name`) et le jeto
 `run()` : une seule exécution à la fois ; un appel pendant une exécution programme **une**
 ré-exécution à la fin. Étapes, dans l'ordre :
 
+0. **Compte** (en ligne + jeton) — `drive.about()` (une fois par jeton) donne l'email du jeton ;
+   comparé (sans casse) à `kv device.ownerEmail`. Pas de propriétaire et `hasLocalJournal` faux
+   → le compte est adopté. Propriétaire différent, ou données locales sans propriétaire →
+   **conflit** : `status.accountConflict = { owner?, current }`, aucune étape distante (2→6), aucun
+   téléchargement d'audio ; l'analyse (1) continue. Le conflit disparaît avec le jeton. Email vide
+   → erreur notée, étapes distantes suspendues. Garde-fou : chaque appel Drive (hors `about`)
+   vérifie que le jeton courant est celui vérifié ; sinon arrêt des étapes distantes (sans
+   `markExpired`) et nouveau cycle (le compte est revérifié). Les données d'un compte ne partent
+   jamais dans le Drive d'un autre ; aucune suppression n'est déduite du Drive d'un autre compte.
 1. **Analyse** (si `navigator.onLine` et clé Gemini non vide) — entrées `needsAnalysis` dont
    `retryAfter` est passé (ou `force`), plus récentes d'abord :
    - voix : audio depuis `db.getAudio(id)` ; sinon, si `audioFileId` et jeton → télécharger ;
@@ -295,10 +324,14 @@ ré-exécution à la fin. Étapes, dans l'ordre :
    - texte : `analyzeText(transcript)`.
    - succès : `analysis`, `analysisModel`, `analyzedAt`, **`updatedAt = now`**, `needsAnalysis=false`,
      `attempts=0`, erreur effacée, `dirty=true`.
-   - échec : `attempts++`, `error`, `errorKind`, `retryAfter = now + min(1 h, 30 s × 2^attempts)`
+   - échec : `attempts++`, `error`, `errorKind`, `retryAfter = now + min(1 h, 30 s × 2^(attempts+1))`
      (ou `retryAfterMs`). `invalid-key` → arrêter l'étape, `needsKey=true`. `quota`/`network` →
-     arrêter l'étape. `safety` → pas de retry auto (`retryAfter` lointain : +100 ans), retry manuel
-     possible. Au-delà de 5 tentatives → plus de retry auto.
+     arrêter l'étape, **sans** `attempts++` (échec passager : seul le délai s'applique — un quota
+     journalier ne doit pas user les essais). `safety` → pas de retry auto (`retryAfter` lointain :
+     +100 ans), retry manuel possible. Au-delà de 5 tentatives → plus de retry auto.
+     Même règle pour les synthèses (`sync.synthesisBackoff`).
+   - Toute lecture-modification-écriture d'une entrée (synchro ou contrôleur) passe par
+     `withEntryLock`/`updateEntry` : une correction de l'utilisateur n'est jamais écrasée.
 2. **Pull** (jeton requis ; sinon `needsAuth=true` et on saute 2→6) — `listAppData()` :
    - `settings` : si `modifiedTime` ≠ connu → télécharger → `mergeSettings`.
    - entrées : distante inconnue → créer en local (`needsAnalysis = !analysis`, `dirty=false`) ;
@@ -312,7 +345,10 @@ ré-exécution à la fin. Étapes, dans l'ordre :
    - audio : entrées voix avec `hasLocalAudio` et sans `audioFileId` → `createAppDataFile`
      → `audioFileId` ; `dirty=true` **sans** modifier `updatedAt` (champ technique).
    - entrées `dirty` → update (ou create si pas d'id / 404) → `driveFileId`,
-     `remoteModifiedTime`, `dirty=false`.
+     `remoteModifiedTime`, `dirty=false`. Entrée disparue localement pendant l'envoi → seul un
+     fichier **créé** par cet envoi va dans `pendingDeletes` (l'id existant a déjà été mis en
+     attente par celui qui a supprimé l'entrée ; s'il ne l'a pas été — base effacée pendant
+     l'envoi —, le supprimer effacerait une entrée intacte de tous les appareils). Idem synthèses.
    - audio local supprimé (`deleteAudio`, `hasLocalAudio=false`) quand `audioFileId` est défini
      **et** `needsAnalysis=false`.
    - synthèses `dirty`, réglages si `sync.settingsDirty`.
@@ -322,9 +358,13 @@ ré-exécution à la fin. Étapes, dans l'ordre :
    `basedOn === sig` → rien. Sinon générer (au plus `config.maxSynthesesPerRun` par cycle, jours
    les plus récents d'abord), `dirty=true`, puis push immédiat si jeton. Jour avec synthèse mais
    sans entrée → supprimer la synthèse (locale + `pendingDeletes`).
-5. **Ménage** (1 fois par jour local, jeton requis) : fichiers `kind:'audio'` dont `createdTime`
-   < now − `audioRetentionDays` → `deleteFile` ; l'entrée correspondante : `audioFileId=null`,
-   `audioExpired=true`, `dirty=true` (sans toucher `updatedAt`) → push.
+5. **Ménage** (1 fois par jour local, jeton requis ; sauté si `settings.json` n'a pas pu être
+   lu ce cycle) : fichiers `kind:'audio'` dont `createdTime` < now − `audioRetentionDays` →
+   `deleteFile` ; l'entrée correspondante : `audioFileId=null`, `audioExpired=true`, `dirty=true`
+   (sans toucher `updatedAt`) → push. **Exceptions** : l'audio d'une entrée encore
+   `needsAnalysis`, ou sans analyse ni transcription, est gardé (seule copie de son contenu) ;
+   entrée inconnue ici mais présente (ou peut-être présente : pull incomplet) dans Drive →
+   gardé, et le ménage sera refait au cycle suivant. Doublon ou orphelin → supprimé.
 6. **Miroir** (`mirrorEnabled` + jeton) : pour chaque jour, `md = renderDayMarkdown(...)`,
    `sig = fnv1a(md)` ; si ≠ `mirror.state.days[day].sig` → `ensureFolder` (racine « Dit Harry »
    puis année) → `upsertTextFile` → mémoriser. Jour disparu → supprimer le fichier. Si un id de
@@ -342,15 +382,30 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 - Démarrage : `navigator.storage.persist()`, `auth.init()`, chargement des réglages et des
   données, **récupération** des enregistrements interrompus (`db.listRecordingIds()` → assembler
   les morceaux triés → créer une entrée voix « récupérée » → `deleteChunks`) puis `sync.run()`.
+  Échec de récupération → toast (« libère de la place, puis relance l'appli »).
+  Données locales sans `device.ownerEmail` mais email de compte connu → attribuées à ce compte.
+- `auth.init()` est relancé (sans effet si le script GIS est déjà là) sur `online`, au retour au
+  premier plan (en ligne) et au passage à `expired` : après un démarrage hors ligne, « Se
+  reconnecter » ouvre la popup dès le premier appui.
 - Déclencheurs de `sync.run()` : démarrage, nouvelle entrée, événement `online`, passage à
   `signed-in`, retour au premier plan (si dernier cycle > 2 min), bouton « Synchroniser ».
 - Nouvelle entrée voix : `putAudio` → `putEntry` (`dirty:true, needsAnalysis:true,
   hasLocalAudio:true, attempts:0`, `day = dayKey(startedAt)`, `createdAt = startedAt`) →
-  `deleteChunks(recordingId)` → `sync.run()`.
+  `deleteChunks(recordingId)` → `sync.run()`. Échec d'écriture (stockage plein) → le résultat
+  reste en mémoire (`unsavedRecording`) : bandeau « Réessayer » / « Télécharger » (puis « Fermer »).
 - Entrée texte : `source:'text'`, `transcript = texte`, `needsAnalysis:true`.
 - Correction : `transcript`, `transcriptEdited:true`, `updatedAt=now`, `dirty`, `needsAnalysis`.
-- Suppression : supprimer en local (entrée + audio), ajouter `driveFileId` et `audioFileId` à
-  `sync.pendingDeletes`, puis `sync.run()`.
+- Suppression (sous `withEntryLock`) : ajouter `driveFileId` et `audioFileId` à
+  `sync.pendingDeletes` **puis** supprimer en local (entrée + audio), puis `sync.run()`.
+- Déconnexion avec « Effacer les données de cet appareil » : si en ligne avec un jeton du bon
+  compte, `sync.run()` d'abord (borné à 60 s : suppressions en attente et entrées envoyées),
+  puis `auth.signOut()`, attente de la fin du cycle en cours (bornée), puis `db.clearAll()`.
+  Le dialogue prévient des entrées non envoyées ET des suppressions pas encore appliquées.
+- Conflit de compte (`syncStatus.accountConflict`, compte connecté) : écran bloquant « Un autre
+  journal est sur ce téléphone » (jamais pendant un enregistrement) : « Annuler — revenir à
+  {owner} » (`auth.signOut()`, données gardées) ; « Effacer les données de cet appareil »
+  (confirmation, `clearAll()`, puis synchro : le compte connecté est adopté) ; propriétaire
+  inconnu → aussi « C'est mon journal : continuer avec {current} » (`device.ownerEmail = current`).
 - Réessayer : `attempts=0`, `retryAfter` effacé, `needsAnalysis=true` → `sync.run({force:true})`.
 - Synthèse manuelle d'un jour : ajouter à `sync.forceSynthesisDays` → `sync.run()`.
 - Lecture audio : blob local sinon `drive.downloadBlob(audioFileId)` → `URL.createObjectURL`
@@ -368,9 +423,14 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 - Routage hash : `#/` (Aujourd'hui), `#/journal`, `#/jour/<YYYY-MM-DD>`, `#/entree/<id>`,
   `#/reglages`. Barre d'onglets en bas : Aujourd'hui · Journal · Réglages.
 - **Accueil (non connecté)** : nom, accroche, bouton « Se connecter avec Google ». Si l'id client
-  manque : message de configuration.
+  manque : message de configuration. Si l'appareil garde le journal d'un compte : « Ce téléphone
+  garde le journal de {email} : connecte-toi avec ce compte pour le retrouver. »
 - **Clé Gemini manquante** : écran d'accueil de réglage (coller la clé, lien
-  https://aistudio.google.com/apikey, bouton « Vérifier », « Plus tard »).
+  https://aistudio.google.com/apikey, bouton « Vérifier », « Plus tard »). Jamais affiché pendant
+  un enregistrement (il remplacerait le bouton Arrêter).
+- Changement d'écran : le focus passe au `<h1>` du nouvel écran (`tabindex=-1`), sauf si un
+  champ de saisie a déjà le focus ou qu'un dialogue est ouvert (lecteurs d'écran).
+- Champs et interrupteur éteint : bordure/piste `--control-border` (≥ 3:1, WCAG 1.4.11).
 - **Aujourd'hui** : date du jour ; gros bouton rond d'enregistrement (appui = démarrer, appui =
   arrêter), anneau animé selon le niveau, chrono, bouton « Annuler » pendant l'enregistrement ;
   bouton « Écrire » (saisie texte) ; liste des entrées du jour (heure, titre ou « Analyse en
@@ -394,9 +454,12 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 - `manifest.webmanifest` : URLs **relatives** (`start_url: "./"`, `scope: "./"`), `display:
   standalone`, `lang: fr`, icônes 192/512 PNG + 512 maskable + SVG.
 - `sw.js` (écrit à la main, sans Workbox) : enregistré depuis `main.ts` en production avec
-  `import.meta.env.BASE_URL + 'sw.js'`. Navigation → réseau d'abord, repli sur `index.html` en
+  `import.meta.env.BASE_URL + 'sw.js'`. Navigation → réseau d'abord **en `cache: 'no-cache'`**
+  (jamais une ancienne page du cache HTTP après un déploiement), repli sur `index.html` en
   cache ; ressources même origine → cache d'abord (fichiers hashés) ; **jamais** de cache pour les
-  autres origines (Google, Gemini) ni pour les requêtes non-GET. Nettoyage des anciens caches.
+  autres origines (Google, Gemini) ni pour les requêtes non-GET. Précache **atomique** : page ou
+  fichier `assets/` manquant → l'installation échoue (l'ancien worker et son cache restent) ; la
+  page est mise en cache en dernier. Nettoyage des anciens caches à l'activation.
 
 ## 12. Mode démo (`npm run dev:mock`, `VITE_MOCK=1`)
 

@@ -45,7 +45,9 @@ function fakeAuth(initial: AuthState = { status: 'signed-in', email: 'moi@exempl
   const subs = new Set<(s: AuthState) => void>();
   const calls: string[] = [];
   const auth: AuthService = {
-    init: async () => undefined,
+    init: async () => {
+      calls.push('init');
+    },
     getState: () => state,
     subscribe(cb) {
       subs.add(cb);
@@ -59,6 +61,7 @@ function fakeAuth(initial: AuthState = { status: 'signed-in', email: 'moi@exempl
     getToken: () => 'jeton',
     markExpired: () => undefined,
     signOut: async () => {
+      calls.push('signOut');
       state = { status: 'signed-out' };
       for (const cb of subs) cb(state);
     },
@@ -107,10 +110,18 @@ function fakeRecorder(db: LocalDb, result: RecordingResult) {
   return rec;
 }
 
-function makeServices(opts: { checkKey?: () => Promise<void>; recorder?: (db: LocalDb) => VoiceRecorder } = {}) {
+function makeServices(
+  opts: { checkKey?: () => Promise<void>; recorder?: (db: LocalDb) => VoiceRecorder; authState?: AuthState } = {},
+) {
   const db = createLocalDb(`ctrl-test-${++dbSeq}-${Date.now()}`);
-  const { auth, calls } = fakeAuth();
+  const { auth, calls } = fakeAuth(opts.authState);
   const { sync, runs, status: syncStatus } = fakeSync();
+  // Journal des appels (ordre) : synchro et déconnexion
+  const runSync = sync.run;
+  sync.run = (o) => {
+    calls.push('sync');
+    return runSync(o);
+  };
   const drive = {
     downloadBlob: async () => new Blob(['distant'], { type: 'audio/webm' }),
   } as unknown as DriveClient;
@@ -364,5 +375,159 @@ describe('AppController', () => {
     app.releaseAudio();
     expect(revoked).toEqual(['blob:0', 'blob:1']);
     vi.restoreAllMocks();
+  });
+
+  it('écran de clé Gemini : jamais affiché pendant un enregistrement', async () => {
+    const { services } = makeServices();
+    const app = new AppController(services);
+    await app.start();
+    expect(app.firstSyncDone).toBe(true);
+    expect(app.showKeySetup).toBe(true);
+
+    await app.startRecording();
+    expect(app.recording.status).toBe('recording');
+    expect(app.showKeySetup).toBe(false);
+    await app.stopRecording();
+    expect(app.showKeySetup).toBe(true);
+    app.destroy();
+  });
+
+  it('retour du réseau après un démarrage hors ligne : le script de connexion Google est rechargé', async () => {
+    const { services, authCalls } = makeServices({
+      authState: { status: 'error', email: 'moi@exemple.fr', error: 'Le service de connexion Google n’a pas pu être chargé.' },
+    });
+    const app = new AppController(services);
+    await app.start();
+    const before = authCalls.filter((c) => c === 'init').length;
+    window.dispatchEvent(new Event('online'));
+    expect(authCalls.filter((c) => c === 'init').length).toBe(before + 1);
+    app.destroy();
+  });
+
+  it('enregistrement non gardé (stockage plein) : conservé en mémoire, « Réessayer » le transforme en entrée', async () => {
+    const result = voiceResult('rec-plein');
+    const { services, db } = makeServices({ recorder: (d) => fakeRecorder(d, result) });
+    const app = new AppController(services);
+    await app.start();
+    const putAudio = db.putAudio.bind(db);
+    db.putAudio = async () => {
+      throw new AppError('other', 'Le stockage de cet appareil est plein. Libère de la place puis réessaie.', {
+        retryable: false,
+      });
+    };
+
+    await app.startRecording();
+    await app.stopRecording();
+    expect(app.recording.status).toBe('idle');
+    expect(app.unsavedRecording?.result.recordingId).toBe('rec-plein');
+    expect(await db.getEntry('rec-plein')).toBeUndefined();
+    expect(app.toasts.at(-1)?.kind).toBe('error');
+
+    // Toujours plein : l'enregistrement reste proposé
+    await app.retryUnsavedRecording();
+    expect(app.unsavedRecording).not.toBeNull();
+
+    db.putAudio = putAudio;
+    await app.retryUnsavedRecording();
+    expect(app.unsavedRecording).toBeNull();
+    expect((await db.getEntry('rec-plein'))?.source).toBe('voice');
+    expect(await db.getAudio('rec-plein')).toBeDefined();
+    expect(await db.listRecordingIds()).toEqual([]);
+    app.destroy();
+  });
+
+  it('déconnexion + effacement : synchro d’abord (suppressions en attente envoyées), puis base effacée', async () => {
+    const { services, db, authCalls } = makeServices();
+    await db.putEntry(textEntry('e1', { driveFileId: 'f1' }));
+    await db.setKv('sync.pendingDeletes', ['f-supprimée']);
+    const app = new AppController(services);
+    await app.start();
+    expect(await app.countPendingDeletes()).toBe(1);
+    authCalls.length = 0;
+
+    await app.signOut(true);
+    expect(authCalls.slice(0, 2)).toEqual(['sync', 'signOut']);
+    expect(await db.listEntries()).toEqual([]);
+    expect(await db.getKv('sync.pendingDeletes')).toBeUndefined();
+    expect(app.entries).toEqual([]);
+    app.destroy();
+  });
+
+  it('déconnexion simple : pas de synchro forcée, données gardées', async () => {
+    const { services, db, authCalls } = makeServices();
+    await db.putEntry(textEntry('e1'));
+    const app = new AppController(services);
+    await app.start();
+    authCalls.length = 0;
+    await app.signOut(false);
+    expect(authCalls).toEqual(['signOut']);
+    expect((await db.listEntries()).map((e) => e.id)).toEqual(['e1']);
+    app.destroy();
+  });
+
+  it('données d’avant la vérification du compte : attribuées au dernier compte connecté', async () => {
+    const { services, db } = makeServices();
+    await db.putEntry(textEntry('e1'));
+    const app = new AppController(services);
+    await app.start();
+    expect(await db.getKv('device.ownerEmail')).toBe('moi@exemple.fr');
+    expect(app.deviceOwner).toBe('moi@exemple.fr');
+    app.destroy();
+
+    // Appareil vierge : rien n'est attribué d'avance (la synchro adoptera le compte vérifié)
+    const fresh = makeServices();
+    const app2 = new AppController(fresh.services);
+    await app2.start();
+    expect(await fresh.db.getKv('device.ownerEmail')).toBeUndefined();
+    app2.destroy();
+  });
+
+  it('conflit de compte : écran affiché ; « Effacer » vide l’appareil puis relance la synchro', async () => {
+    const { services, db, runs, syncStatus } = makeServices();
+    syncStatus.accountConflict = { owner: 'moi@exemple.fr', current: 'travail@exemple.fr' };
+    await db.putEntry(textEntry('e1', { dirty: true }));
+    await db.setKv('device.ownerEmail', 'moi@exemple.fr');
+    const app = new AppController(services);
+    await app.start();
+    expect(app.accountConflict).toEqual({ owner: 'moi@exemple.fr', current: 'travail@exemple.fr' });
+    expect(app.showAccountConflict).toBe(true);
+    const before = runs.length;
+
+    await app.eraseDeviceForNewAccount();
+    expect(await db.listEntries()).toEqual([]);
+    expect(await db.getKv('device.ownerEmail')).toBeUndefined();
+    expect(app.deviceOwner).toBeNull();
+    expect(runs.length).toBe(before + 1);
+    app.destroy();
+  });
+
+  it('conflit de compte : « Annuler » déconnecte le nouveau compte et garde le journal', async () => {
+    const { services, db, syncStatus, authCalls } = makeServices();
+    syncStatus.accountConflict = { owner: 'moi@exemple.fr', current: 'travail@exemple.fr' };
+    await db.putEntry(textEntry('e1'));
+    await db.setKv('device.ownerEmail', 'moi@exemple.fr');
+    const app = new AppController(services);
+    await app.start();
+    await app.cancelAccountSwitch();
+    expect(authCalls).toContain('signOut');
+    expect(app.hasAccount).toBe(false);
+    expect((await db.listEntries()).map((e) => e.id)).toEqual(['e1']);
+    expect(await db.getKv('device.ownerEmail')).toBe('moi@exemple.fr');
+    expect(app.toasts.at(-1)?.message).toMatch(/Connecte-toi avec moi@exemple\.fr/);
+    app.destroy();
+  });
+
+  it('conflit sans propriétaire connu : « C’est mon journal » attribue les données au compte connecté', async () => {
+    const { services, db, runs, syncStatus } = makeServices({ authState: { status: 'signed-in' } });
+    syncStatus.accountConflict = { current: 'moi@exemple.fr' };
+    await db.putEntry(textEntry('e1'));
+    const app = new AppController(services);
+    await app.start();
+    expect(await db.getKv('device.ownerEmail')).toBeUndefined(); // email inconnu : pas d'attribution d'office
+    const before = runs.length;
+    await app.adoptDeviceData();
+    expect(await db.getKv('device.ownerEmail')).toBe('moi@exemple.fr');
+    expect(runs.length).toBe(before + 1);
+    app.destroy();
   });
 });

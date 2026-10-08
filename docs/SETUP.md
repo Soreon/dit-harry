@@ -4,8 +4,9 @@ Ce guide part de zéro et va jusqu'à l'appli installée sur le téléphone Andr
 environ 45 minutes la première fois. Libellés vérifiés en octobre 2026 ; les consoles Google
 et GitHub changent parfois de présentation, mais les noms des pages restent proches.
 
-Dans tout le guide, **`<org>`** désigne le nom de l'organisation GitHub choisie à l'étape 1
-(par exemple `dit-harry`). L'appli sera publiée sur **`https://<org>.github.io/`**.
+Le code est dans le dépôt **`Soreon/dit-harry`** et l'appli est publiée sur
+**`https://soreon.github.io/dit-harry/`**. L'**origine** du site (ce que Google appelle
+*JavaScript origin*) est **`https://soreon.github.io`**, sans le chemin.
 
 **Il te faut :**
 
@@ -19,27 +20,18 @@ Dans tout le guide, **`<org>`** désigne le nom de l'organisation GitHub choisie
 
 ---
 
-## 1. GitHub : une organisation dédiée et son dépôt
+## 1. GitHub : le dépôt
 
-**Pourquoi une organisation ?** Tous les sites GitHub Pages d'un même compte sont servis
-depuis la même origine `https://<compte>.github.io`. Ils partagent donc le stockage du
-navigateur (IndexedDB, localStorage, service workers) et l'autorisation Google. Comme tu as
-déjà d'autres sites, une organisation gratuite donne à Dit Harry sa propre origine,
-`https://<org>.github.io`, isolée des autres.
+Le dépôt `Soreon/dit-harry` existe déjà. Il doit être **public** : c'est obligatoire pour
+GitHub Pages avec l'offre gratuite, et le code ne contient aucun secret.
 
-1. Va sur <https://github.com/organizations/plan> (ou : ta photo en haut à droite →
-   **Your organizations** → **New organization**).
-2. Choisis l'offre **Free** (« Create a free organization »).
-3. **Organization name** : par exemple `dit-harry` (s'il est pris, `dit-harry-<prénom>`…).
-   Ce nom fera partie de l'adresse du site.
-4. **Contact email** : ton email. **This organization belongs to** : *My personal account*.
-   Valide, puis passe l'étape d'invitation de membres.
-5. Dans l'organisation : **Repositories** → **New repository**.
-   - **Repository name** : exactement **`<org>.github.io`** (ex. `dit-harry.github.io`).
-   - **Public** (obligatoire pour GitHub Pages avec l'offre gratuite ; le code ne contient
-     aucun secret).
-   - Ne coche **ni** README, **ni** .gitignore, **ni** licence : le dépôt doit rester vide.
-   - **Create repository**.
+**Origine partagée — risque accepté.** Tous les sites GitHub Pages du compte `Soreon` sont
+servis depuis la même origine `https://soreon.github.io`. Ils partagent donc le stockage du
+navigateur (IndexedDB, localStorage) : un autre de tes sites Pages pourrait techniquement
+lire la clé Gemini et la copie locale du journal. Ce risque a été accepté. Pour l'éliminer
+plus tard : transférer le dépôt vers une organisation GitHub dédiée (dépôt nommé
+`<org>.github.io`) ou utiliser un sous-domaine personnel, puis mettre à jour l'origine
+autorisée du client OAuth (étape 3.6).
 
 ## 2. GitHub Pages : publier via GitHub Actions
 
@@ -110,7 +102,7 @@ non sensibles et n'a pas de logo, la mise en production ne demande aucune valida
 2. **Create client** (« Créer un client »).
 3. **Application type** : **Web application** (« Application Web »). **Name** : `Dit Harry web`.
 4. **Authorized JavaScript origins** (« Origines JavaScript autorisées ») → **Add URI**, trois fois :
-   - `https://<org>.github.io` (ex. `https://dit-harry.github.io`) ;
+   - `https://soreon.github.io` (l'origine seule : **pas** `/dit-harry`) ;
    - `http://localhost:5173` et `http://localhost` (pour le développement sur l'ordinateur :
      la documentation Google demande les deux formes, avec et sans port).
 
@@ -135,19 +127,18 @@ dans le site). Il n'y a aucun secret à stocker pour Dit Harry.
 
 ## 5. Envoyer le code et déployer
 
-Depuis le dossier du projet, sur l'ordinateur :
+Le dépôt local est déjà relié à `https://github.com/Soreon/dit-harry` (branche `main`).
+Pour publier une modification :
 
 ```sh
-git init -b main
-git add .
-git commit -m "Dit Harry v1"
-git remote add origin https://github.com/<org>/<org>.github.io.git
-git push -u origin main
+git add -A
+git commit -m "…"
+git push
 ```
 
 Le push déclenche le workflow. Suis-le dans l'onglet **Actions** du dépôt
 (« Déployer sur GitHub Pages ») : tests → vérification → construction → publication.
-Au bout de 2 à 3 minutes, l'appli est en ligne sur **`https://<org>.github.io/`**.
+Au bout de 2 à 3 minutes, l'appli est en ligne sur **`https://soreon.github.io/dit-harry/`**.
 
 - Pour relancer un déploiement sans modifier le code (par exemple après avoir changé la
   variable `GOOGLE_CLIENT_ID`) : **Actions** → « Déployer sur GitHub Pages » → **Run workflow**.
@@ -171,13 +162,17 @@ Au bout de 2 à 3 minutes, l'appli est en ligne sur **`https://<org>.github.io/`
 - Depuis le 28 mai 2026, AI Studio crée des clés « auth keys » utilisables directement. Une
   ancienne clé « standard » doit être **restreinte à l'API Gemini** (dans AI Studio : survoler
   « Unrestricted » → **Add restrictions** → **Restrict to Gemini API only**), sinon Gemini la refuse.
+- Restriction **par site web** (facultative, dans la console Google Cloud) : le navigateur
+  n'envoie à Gemini que l'**origine** du site, jamais le chemin. Autorise donc
+  `https://soreon.github.io/*` — et non `https://soreon.github.io/dit-harry/*`, qui ne correspondrait
+  jamais (toutes les analyses seraient refusées « depuis ce site »).
 - L'**offre gratuite** suffit (pas de facturation à activer). Elle a des limites de requêtes
   par minute et par jour, visibles dans AI Studio. Voir la section Confidentialité du
   [README](../README.md#confidentialité) pour l'usage des données.
 
 ## 7. Installer l'appli sur le téléphone Android
 
-1. Sur le téléphone, ouvre **Chrome** à l'adresse `https://<org>.github.io/`.
+1. Sur le téléphone, ouvre **Chrome** à l'adresse `https://soreon.github.io/dit-harry/`.
 2. **Se connecter avec Google** → choisis ton compte → sur l'écran d'autorisation, **coche les
    deux cases Google Drive** → **Continuer**.
 3. Colle la clé Gemini (étape 6) si ce n'est pas déjà fait.
@@ -216,7 +211,7 @@ npm run dev           # http://localhost:5173
 **Rien ne se passe en touchant « Se connecter » / popup bloquée.**
 Chrome n'ouvre la fenêtre Google que juste après un appui. Réessaie en touchant une seule
 fois le bouton. Si elle reste bloquée : Chrome **⋮** → **Paramètres** → **Paramètres des
-sites** → **Pop-ups et redirections** → autoriser `<org>.github.io`.
+sites** → **Pop-ups et redirections** → autoriser `soreon.github.io`.
 
 **« Accès refusé », ou l'appli demande de cocher les deux autorisations.**
 Google laisse décocher chaque autorisation : Dit Harry a besoin des **deux** cases Drive.
@@ -226,7 +221,7 @@ reconnecte-toi depuis l'appli.
 
 **« Erreur 400 : origin_mismatch ».**
 L'adresse du site ne correspond pas aux origines autorisées du client OAuth (étape 3.6).
-Vérifie l'orthographe exacte : `https://<org>.github.io` (sans `/` final) et, en local,
+Vérifie l'orthographe exacte : `https://soreon.github.io` (sans `/dit-harry` ni `/` final) et, en local,
 `http://localhost:5173`. Après une modification, attends quelques minutes (jusqu'à quelques
 heures).
 
@@ -240,12 +235,24 @@ entre-temps restent sur le téléphone et partent dès la reconnexion.
 
 **Gemini : « quota dépassé » (erreur 429).**
 Les limites de l'offre gratuite sont atteintes (par minute ou par jour). Rien n'est perdu :
-l'appli réessaie toute seule plus tard. Les limites sont visibles dans AI Studio. Si cela
-arrive souvent, choisis un modèle plus léger dans **Réglages**.
+l'appli réessaie toute seule plus tard — après la remise à zéro du quota journalier (minuit
+heure du Pacifique, vers 9 h en France) si c'est lui qui est épuisé ; ces échecs ne consomment
+pas les essais automatiques. Les limites sont visibles dans AI Studio. Si cela arrive souvent,
+choisis un modèle plus léger dans **Réglages**.
 
 **Gemini : « clé refusée ».**
 Vérifie la clé dans **Réglages** → **Vérifier**. Si c'est une ancienne clé standard, restreins-la
 à l'API Gemini (étape 6) ou crée une nouvelle clé.
+
+**Gemini : « clé refusée depuis ce site ».**
+La clé est limitée à certains sites web : autorise l'origine indiquée dans le message
+(`https://soreon.github.io/*`, sans le chemin de l'appli — voir l'étape 6).
+
+**« Un autre journal est sur ce téléphone ».**
+Tu t'es connecté avec un autre compte Google que celui dont le journal est sur le téléphone.
+La synchronisation est en pause pour ne pas mélanger les deux : **Annuler** pour revenir au
+premier compte, ou **Effacer les données de cet appareil** pour continuer avec le nouveau (ce qui
+est déjà dans le Drive du premier compte y reste).
 
 **Le déploiement échoue à l'étape « Configurer Pages ».**
 GitHub Pages n'est pas réglé sur **GitHub Actions** (étape 2).

@@ -6,11 +6,12 @@
 import { createContext } from 'svelte';
 import { config } from '../config';
 import { buildExportZip, downloadBlob } from './backup';
-import { updateKv } from './db';
+import { updateEntry, updateKv, withEntryLock, withKvLock } from './db';
 import { toAppError } from './errors';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings as storeSettings } from './settings';
-import { pendingCountOf } from './sync';
+import { KV_DEVICE_OWNER, hasLocalJournal, pendingCountOf } from './sync';
 import type {
+  AccountConflict,
   AuthState,
   DayKey,
   EntryLocalState,
@@ -23,7 +24,7 @@ import type {
   SyncStatus,
   VoiceRecorder,
 } from './types';
-import { dayKey, newId, sleep, stripMimeParams } from './util';
+import { audioExtension, dayKey, newId, sleep, stripMimeParams } from './util';
 import { groupDays, parseRoute, routeHash, type DayGroup, type Route } from '../components/helpers';
 
 export interface Toast {
@@ -54,6 +55,15 @@ const LS_KEY_LATER = 'dh.ui.keyLater';
 const RESYNC_ON_FOCUS_MS = 2 * 60 * 1000;
 /** Attente maximale de `auth.init()` avant la première synchro. */
 const AUTH_INIT_WAIT_MS = 8_000;
+/** Attente maximale de la fin d'un cycle de synchro avant d'effacer la base. */
+const SYNC_IDLE_WAIT_MS = 60_000;
+
+/** Enregistrement qui n'a pas pu être gardé (stockage plein) : seul exemplaire, en mémoire. */
+export interface UnsavedRecording {
+  result: RecordingResult;
+  /** Déjà téléchargé par l'utilisateur : il peut alors l'abandonner. */
+  downloaded: boolean;
+}
 
 const IDLE_SYNC: SyncStatus = {
   running: false,
@@ -130,6 +140,14 @@ export class AppController {
   exporting = $state(false);
   /** Brouillon de saisie texte (gardé si on ferme la feuille). */
   textDraft = $state('');
+  /** Enregistrement non gardé (échec d'écriture locale) : « Réessayer » / « Télécharger ». */
+  unsavedRecording = $state.raw<UnsavedRecording | null>(null);
+  /** Compte Google à qui appartiennent les données de cet appareil (kv `device.ownerEmail`). */
+  deviceOwner = $state<string | null>(null);
+  /** Déconnexion en cours (envoi des dernières modifications, effacement…). */
+  signingOut = $state(false);
+  /** Choix en cours sur l'écran de conflit de compte. */
+  resolvingConflict = $state(false);
 
   /* --- Dérivés ------------------------------------------------------- */
   days: DayGroup[] = $derived(groupDays(this.entries, this.syntheses));
@@ -142,8 +160,23 @@ export class AppController {
   needsReconnect: boolean = $derived(
     this.hasAccount && (this.auth.status === 'expired' || this.auth.status === 'error'),
   );
+  /** Compte connecté ≠ propriétaire des données de l'appareil (synchro Drive en pause). */
+  accountConflict: AccountConflict | undefined = $derived(
+    this.auth.status === 'signed-in' ? this.syncStatus.accountConflict : undefined,
+  );
+  /** Jamais d'écran qui remplace l'appli pendant un enregistrement (ni bouton Arrêter, ni témoin). */
+  showAccountConflict: boolean = $derived(
+    this.hasAccount && !!this.accountConflict && this.recording.status === 'idle',
+  );
   showKeySetup: boolean = $derived(
-    this.hasAccount && this.ready && this.firstSyncDone && !this.hasKey && this.keyLaterDay !== this.today,
+    this.hasAccount &&
+      this.ready &&
+      this.firstSyncDone &&
+      !this.hasKey &&
+      this.keyLaterDay !== this.today &&
+      this.recording.status === 'idle' &&
+      // Le bandeau « enregistrement non gardé » (Réessayer / Télécharger) doit rester visible.
+      !this.unsavedRecording,
   );
 
   /* --- Interne ------------------------------------------------------- */
@@ -192,6 +225,7 @@ export class AppController {
       this.settings = await loadSettings(db);
       await this.reload();
       await this.recoverRecordings();
+      await this.adoptLegacyOwner();
     } catch (e) {
       this.toast(toAppError(e).message, 'error');
     } finally {
@@ -214,6 +248,24 @@ export class AppController {
     this.disposers.push(() => target.removeEventListener(type, handler));
   }
 
+  /**
+   * Données locales d'avant la vérification du compte (pas de `device.ownerEmail`) : elles
+   * appartiennent au dernier compte connecté sur cet appareil. Sans compte connu, la synchro
+   * demandera à l'utilisateur (écran de conflit de compte).
+   */
+  private async adoptLegacyOwner(): Promise<void> {
+    const { db, auth } = this.services;
+    const email = auth.getState().email?.trim();
+    if (!email) return;
+    const adopted = await withKvLock(db, async () => {
+      if (await db.getKv<string>(KV_DEVICE_OWNER)) return false;
+      if (!(await hasLocalJournal(db))) return false; // appareil vierge : adopté au premier cycle
+      await db.setKv(KV_DEVICE_OWNER, email);
+      return true;
+    });
+    if (adopted) this.deviceOwner = email;
+  }
+
   private async requestPersistentStorage(): Promise<void> {
     try {
       if (navigator.storage && 'persist' in navigator.storage) await navigator.storage.persist();
@@ -227,6 +279,11 @@ export class AppController {
     this.auth = s;
     // Passage à « connecté » → synchro (le démarrage lance déjà la sienne une fois prêt)
     if (s.status === 'signed-in' && prev !== 'signed-in' && this.ready) void this.runSync();
+    // Jeton expiré après un démarrage hors ligne (script Google absent) : on le recharge avant
+    // que l'utilisateur n'appuie sur « Se reconnecter ». Hors de la notification en cours.
+    if (s.status === 'expired' && prev !== 'expired' && this.online) {
+      queueMicrotask(() => this.reloadGoogleSignIn());
+    }
   }
 
   private onHashChange = (): void => {
@@ -238,6 +295,10 @@ export class AppController {
 
   private onOnline = (): void => {
     this.online = true;
+    // Démarrage hors ligne : le script Google n'a pas pu se charger. On le recharge dès le
+    // retour du réseau, pour que « Se reconnecter » ouvre la fenêtre dès le premier appui
+    // (sans effet si le script est déjà là).
+    this.reloadGoogleSignIn();
     void this.runSync();
   };
 
@@ -245,8 +306,16 @@ export class AppController {
     this.online = false;
   };
 
+  /** Recharge le script de connexion Google s'il manque (`init()` ne fait rien s'il est prêt). */
+  private reloadGoogleSignIn(): void {
+    const st = this.auth.status;
+    if (st !== 'error' && st !== 'expired' && st !== 'signed-out') return;
+    this.services.auth.init().catch((e: unknown) => console.warn('[auth] init', e));
+  }
+
   private onVisibilityChange = (): void => {
     if (document.visibilityState !== 'visible') return;
+    if (this.online) this.reloadGoogleSignIn();
     this.tick();
     const last = this.syncStatus.lastSyncAt ? Date.parse(this.syncStatus.lastSyncAt) : 0;
     if (!this.syncStatus.running && Date.now() - last > RESYNC_ON_FOCUS_MS) void this.runSync();
@@ -282,13 +351,15 @@ export class AppController {
     this.reloading = (async () => {
       do {
         this.reloadAgain = false;
-        const [entries, syntheses, settings] = await Promise.all([
+        const [entries, syntheses, settings, owner] = await Promise.all([
           db.listEntries(),
           db.listSyntheses(),
           loadSettings(db),
+          db.getKv<unknown>(KV_DEVICE_OWNER),
         ]);
         this.entries = entries;
         this.syntheses = Object.fromEntries(syntheses.map((s) => [s.day, s]));
+        this.deviceOwner = typeof owner === 'string' && owner ? owner : null;
         // Même contenu → même objet : évite d'écraser un champ de réglage en cours de saisie
         if (!sameSettings(settings, this.settings)) this.settings = settings;
       } while (this.reloadAgain);
@@ -348,27 +419,140 @@ export class AppController {
   }
 
   async signOut(clearDevice: boolean): Promise<void> {
-    if (this.recorder) await this.cancelRecording();
+    if (this.signingOut) return;
+    this.signingOut = true;
     try {
-      await this.services.auth.signOut();
-    } catch (e) {
-      console.warn('[auth] signOut', e);
-    }
-    if (clearDevice) {
+      if (this.recorder) await this.cancelRecording();
+      // Avant d'effacer : envoyer ce qui peut l'être, suppressions en attente comprises
+      // (sinon les entrées supprimées ici reviendraient de Drive à la prochaine connexion).
+      if (clearDevice) await this.flushBeforeClear();
       try {
-        await this.services.db.clearAll();
+        await this.services.auth.signOut();
       } catch (e) {
-        this.toast(toAppError(e).message, 'error');
+        console.warn('[auth] signOut', e);
       }
-      this.releaseAudio();
-      writeLocal(LS_KEY_LATER, null);
-      this.keyLaterDay = null;
-      this.textDraft = '';
+      if (clearDevice) {
+        // Un cycle lancé avec l'ancien jeton écrirait encore dans la base effacée.
+        await this.waitSyncIdle();
+        await this.clearDeviceData();
+      }
+      this.firstSyncDone = false;
+      await this.reload();
+      location.hash = '#/';
+      this.toast(clearDevice ? 'Déconnecté, données de cet appareil effacées.' : 'Déconnecté.', 'info');
+    } finally {
+      this.signingOut = false;
     }
-    this.firstSyncDone = false;
-    await this.reload();
-    location.hash = '#/';
-    this.toast(clearDevice ? 'Déconnecté, données de cet appareil effacées.' : 'Déconnecté.', 'info');
+  }
+
+  /** Synchro complète avant effacement, si elle est possible (en ligne, jeton, bon compte). */
+  private async flushBeforeClear(): Promise<void> {
+    const { auth, sync } = this.services;
+    if (!this.online || !auth.getToken() || this.accountConflict) return;
+    this.toast('Envoi de tes dernières modifications avant l’effacement…', 'info');
+    // Borné : une longue analyse Gemini ne doit pas bloquer la déconnexion. Ce qui n'est pas
+    // parti est perdu, comme l'annonce le dialogue de confirmation.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      sync.run().catch((e: unknown) => console.warn('[sync]', e)),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SYNC_IDLE_WAIT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+
+  /** Attend la fin du cycle de synchro en cours (borné). */
+  private async waitSyncIdle(maxMs = SYNC_IDLE_WAIT_MS): Promise<void> {
+    const deadline = Date.now() + maxMs;
+    while (this.services.sync.getStatus().running && Date.now() < deadline) await sleep(100);
+  }
+
+  /** Efface la base locale et l'état d'interface lié aux données. */
+  private async clearDeviceData(): Promise<void> {
+    try {
+      await this.services.db.clearAll();
+    } catch (e) {
+      this.toast(toAppError(e).message, 'error');
+    }
+    this.releaseAudio();
+    writeLocal(LS_KEY_LATER, null);
+    this.keyLaterDay = null;
+    this.textDraft = '';
+    this.unsavedRecording = null;
+    this.deviceOwner = null;
+  }
+
+  /** Nb de fichiers Drive dont la suppression n'est pas encore faite (kv `sync.pendingDeletes`). */
+  async countPendingDeletes(): Promise<number> {
+    try {
+      return kvStrings(await this.services.db.getKv<unknown>(KV_PENDING_DELETES)).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  /* ================================================================== */
+  /* Conflit de compte (autre compte Google que celui des données)       */
+  /* ================================================================== */
+
+  /** « Annuler » : déconnecte le compte qui vient de se connecter, garde le journal de l'appareil. */
+  async cancelAccountSwitch(): Promise<void> {
+    if (this.resolvingConflict) return;
+    this.resolvingConflict = true;
+    const owner = this.accountConflict?.owner ?? this.deviceOwner;
+    try {
+      try {
+        await this.services.auth.signOut();
+      } catch (e) {
+        console.warn('[auth] signOut', e);
+      }
+      this.firstSyncDone = false;
+      location.hash = '#/';
+      this.toast(
+        owner ? `Déconnecté. Connecte-toi avec ${owner} pour retrouver ton journal.` : 'Déconnecté.',
+        'info',
+        6500,
+      );
+    } finally {
+      this.resolvingConflict = false;
+    }
+  }
+
+  /** « Effacer les données de cet appareil » puis continuer avec le compte connecté. */
+  async eraseDeviceForNewAccount(): Promise<void> {
+    if (this.resolvingConflict) return;
+    this.resolvingConflict = true;
+    try {
+      if (this.recorder) await this.cancelRecording();
+      await this.waitSyncIdle();
+      await this.clearDeviceData();
+      this.firstSyncDone = false;
+      await this.reload();
+      location.hash = '#/';
+      this.toast('Données de cet appareil effacées.', 'info');
+      // Appareil vierge : la synchro adopte le compte connecté et tire son journal.
+      await this.runSync();
+    } finally {
+      this.resolvingConflict = false;
+    }
+  }
+
+  /** Propriétaire inconnu → « C'est mon journal » : ces données sont celles du compte connecté. */
+  async adoptDeviceData(): Promise<void> {
+    const c = this.accountConflict;
+    if (!c || c.owner || this.resolvingConflict) return;
+    this.resolvingConflict = true;
+    try {
+      const { db } = this.services;
+      await withKvLock(db, () => db.setKv(KV_DEVICE_OWNER, c.current));
+      this.deviceOwner = c.current;
+      await this.runSync();
+    } catch (e) {
+      this.toast(toAppError(e).message, 'error');
+    } finally {
+      this.resolvingConflict = false;
+    }
   }
 
   /* ================================================================== */
@@ -432,7 +616,15 @@ export class AppController {
         this.toast("L'enregistrement est vide, rien n'a été gardé.", 'error');
         return;
       }
-      await this.storeRecording(res);
+      try {
+        await this.storeRecording(res);
+      } catch (e) {
+        // Souvent la seule copie complète (stockage plein : les morceaux n'ont peut-être pas pu
+        // être écrits non plus) → gardée en mémoire, « Réessayer » / « Télécharger l'audio ».
+        this.unsavedRecording = { result: res, downloaded: false };
+        this.toast(`${toAppError(e).message} L'enregistrement est gardé en attendant.`, 'error');
+        return;
+      }
       await this.reload();
       this.toast(
         auto ? 'Enregistrement arrêté automatiquement — il est bien gardé.' : 'Entrée enregistrée.',
@@ -444,6 +636,43 @@ export class AppController {
     } finally {
       this.resetRecording();
     }
+  }
+
+  /** Bandeau « enregistrement non gardé » → Réessayer l'écriture locale. */
+  async retryUnsavedRecording(): Promise<void> {
+    const pending = this.unsavedRecording;
+    if (!pending) return;
+    try {
+      await this.storeRecording(pending.result);
+    } catch (e) {
+      this.toast(toAppError(e).message, 'error');
+      return;
+    }
+    if (this.unsavedRecording === pending) this.unsavedRecording = null;
+    await this.reload();
+    this.toast('Entrée enregistrée.', 'success');
+    void this.runSync();
+  }
+
+  /** Bandeau « enregistrement non gardé » → Télécharger l'audio (fichier dans Téléchargements). */
+  downloadUnsavedRecording(): void {
+    const pending = this.unsavedRecording;
+    if (!pending) return;
+    const { result } = pending;
+    const mime = stripMimeParams(result.mimeType || result.blob.type) || 'audio/webm';
+    const stamp = (result.startedAt || new Date().toISOString()).slice(0, 19).replace(/[:T]/g, '-');
+    try {
+      downloadBlob(result.blob, `dit-harry-${stamp}.${audioExtension(mime)}`);
+    } catch (e) {
+      this.toast(toAppError(e).message, 'error');
+      return;
+    }
+    this.unsavedRecording = { ...pending, downloaded: true };
+  }
+
+  /** Abandon (proposé seulement une fois l'audio téléchargé). */
+  dismissUnsavedRecording(): void {
+    if (this.unsavedRecording?.downloaded) this.unsavedRecording = null;
   }
 
   private resetRecording(): void {
@@ -474,13 +703,19 @@ export class AppController {
     };
     await db.putAudio(id, res.blob);
     await db.putEntry(entry);
-    await db.deleteChunks(res.recordingId);
+    try {
+      await db.deleteChunks(res.recordingId);
+    } catch (e) {
+      // L'entrée est gardée : les morceaux restants seront ignorés à la prochaine récupération.
+      console.warn('[enregistrement] morceaux non supprimés', e);
+    }
   }
 
   /** Démarrage : transforme les morceaux d'enregistrements interrompus en entrées. */
   private async recoverRecordings(): Promise<void> {
     const { db } = this.services;
     let recovered = 0;
+    let failed = 0;
     for (const recordingId of await db.listRecordingIds()) {
       try {
         const chunks = (await db.getChunks(recordingId)).sort((a, b) => a.index - b.index);
@@ -509,8 +744,19 @@ export class AppController {
         });
         recovered++;
       } catch (e) {
+        failed++;
         console.warn('[récupération]', recordingId, e);
       }
+    }
+    if (failed > 0) {
+      // Les morceaux restent : nouvel essai au prochain démarrage.
+      this.toast(
+        failed === 1
+          ? "Un enregistrement interrompu n'a pas pu être récupéré : libère de la place, puis relance l'appli."
+          : `${failed} enregistrements interrompus n'ont pas pu être récupérés : libère de la place, puis relance l'appli.`,
+        'error',
+        10_000,
+      );
     }
     if (recovered > 0) {
       await this.reload();
@@ -559,16 +805,23 @@ export class AppController {
     const transcript = text.trim();
     if (!transcript) return false;
     const { db } = this.services;
-    const e = await db.getEntry(id);
-    if (!e) return false;
-    if (e.transcript === transcript) return true;
-    await db.putEntry({
-      ...e,
-      transcript,
-      transcriptEdited: true,
-      updatedAt: new Date().toISOString(),
-      local: withFreshAnalysis(e.local, true),
+    // Sous le verrou des entrées : la synchro ne peut pas écraser la correction avec une
+    // analyse lue juste avant.
+    const outcome = await withEntryLock(db, async () => {
+      const e = await db.getEntry(id);
+      if (!e) return 'missing';
+      if (e.transcript === transcript) return 'same';
+      await db.putEntry({
+        ...e,
+        transcript,
+        transcriptEdited: true,
+        updatedAt: new Date().toISOString(),
+        local: withFreshAnalysis(e.local, true),
+      });
+      return 'saved';
     });
+    if (outcome === 'missing') return false;
+    if (outcome === 'same') return true;
     await this.reload();
     this.toast('Correction enregistrée, nouvelle analyse en cours.', 'success');
     void this.runSync();
@@ -577,15 +830,22 @@ export class AppController {
 
   async deleteEntry(id: string): Promise<void> {
     const { db } = this.services;
-    const e = await db.getEntry(id);
-    if (!e) return;
-    await db.deleteEntry(id);
-    await db.deleteAudio(id);
-    const remoteIds = [e.local.driveFileId, e.audioFileId].filter((x): x is string => !!x);
-    if (remoteIds.length > 0) {
-      // Sous verrou : la synchro réécrit aussi cette liste (voir db.ts, updateKv).
-      await updateKv(db, KV_PENDING_DELETES, (cur) => [...new Set([...kvStrings(cur), ...remoteIds])]);
-    }
+    // Sous le verrou des entrées (la synchro ne peut pas poser un id Drive entre la lecture et
+    // la suppression), et suppression distante mise en attente AVANT la suppression locale :
+    // si l'appli est tuée entre les deux, l'entrée ne peut pas revenir depuis Drive.
+    const deleted = await withEntryLock(db, async () => {
+      const e = await db.getEntry(id);
+      if (!e) return false;
+      const remoteIds = [e.local.driveFileId, e.audioFileId].filter((x): x is string => !!x);
+      if (remoteIds.length > 0) {
+        // Sous verrou kv : la synchro réécrit aussi cette liste (voir db.ts, updateKv).
+        await updateKv(db, KV_PENDING_DELETES, (cur) => [...new Set([...kvStrings(cur), ...remoteIds])]);
+      }
+      await db.deleteEntry(id);
+      await db.deleteAudio(id);
+      return true;
+    });
+    if (!deleted) return;
     this.releaseAudio(id);
     await this.reload();
     this.toast('Entrée supprimée.', 'info');
@@ -594,9 +854,8 @@ export class AppController {
 
   async retryEntry(id: string): Promise<void> {
     const { db } = this.services;
-    const e = await db.getEntry(id);
-    if (!e) return;
-    await db.putEntry({ ...e, local: withFreshAnalysis(e.local, false) });
+    const saved = await updateEntry(db, id, (e) => ({ ...e, local: withFreshAnalysis(e.local, false) }));
+    if (!saved) return;
     await this.reload();
     await this.runSync({ force: true });
   }

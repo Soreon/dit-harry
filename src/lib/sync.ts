@@ -5,11 +5,12 @@
  * Une seule exécution à la fois ; un appel pendant une exécution programme UNE ré-exécution.
  */
 import { config } from '../config';
-import { updateKv, withKvLock } from './db';
+import { updateEntry, updateKv, withEntryLock, withKvLock } from './db';
 import { AppError, isAppError, toAppError } from './errors';
 import { renderDayMarkdown } from './markdown';
 import { loadSettings, mergeSettings, normalizeSettings } from './settings';
 import type {
+  AccountConflict,
   AiClient,
   AuthService,
   DayKey,
@@ -55,7 +56,14 @@ const KV = {
   /** Interne à sync.ts : échecs de synthèse par jour (évite de réessayer à chaque cycle). */
   synthesisBackoff: 'sync.synthesisBackoff',
   mirrorState: 'mirror.state',
+  ownerEmail: 'device.ownerEmail',
 } as const;
+
+/**
+ * Clé `kv` : email du compte Google à qui appartiennent les données de cet appareil.
+ * Posée au premier cycle connecté d'un appareil vierge ; effacée avec la base (`clearAll`).
+ */
+export const KV_DEVICE_OWNER = KV.ownerEmail;
 
 /** Au-delà de ce nombre de tentatives d'analyse, plus de nouvel essai automatique. */
 const MAX_AUTO_ATTEMPTS = 5;
@@ -108,6 +116,42 @@ interface Ctx {
   remote?: RemoteIndex;
   /** Le pull n'a pas pu tout télécharger : ne pas en déduire de suppressions. */
   pullIncomplete: boolean;
+  /** `settings.json` n'a pas pu être lu : la rétention locale n'est peut-être pas la bonne. */
+  settingsPullFailed: boolean;
+  /** Compte du jeton vérifié (propriétaire des données) : opérations Drive permises. */
+  remoteReady: boolean;
+}
+
+/**
+ * Interne : le jeton Google a changé depuis la vérification du compte (reconnexion pendant le
+ * cycle, peut-être avec un autre compte). Les étapes distantes s'arrêtent, un cycle est relancé.
+ */
+class AccountChangedError extends AppError {
+  constructor() {
+    super('auth', 'Le compte Google a changé pendant la synchronisation.');
+    this.name = 'AccountChangedError';
+  }
+}
+
+function sameEmail(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+/**
+ * Cet appareil garde-t-il un journal déjà synchronisé (entrées, synthèses, suppressions en
+ * attente, ou trace d'une synchro passée) ? Les réglages seuls ne comptent pas.
+ */
+export async function hasLocalJournal(db: LocalDb): Promise<boolean> {
+  const [entries, syntheses, deletes, settingsId, lastSync] = await Promise.all([
+    db.listEntries(),
+    db.listSyntheses(),
+    db.getKv<unknown>(KV.pendingDeletes),
+    db.getKv<unknown>(KV.settingsFileId),
+    db.getKv<unknown>(KV.lastSyncAt),
+  ]);
+  return (
+    entries.length > 0 || syntheses.length > 0 || idList(deletes).length > 0 || !!settingsId || !!lastSync
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -194,6 +238,11 @@ function isRetryablePending(e: LocalEntry): boolean {
   );
 }
 
+/** Échec passager (quota, réseau) : retardé, mais pas compté comme une tentative. */
+function isTransient(err: AppError): boolean {
+  return err.kind === 'quota' || err.kind === 'network';
+}
+
 /** Erreur qui interrompt toutes les étapes distantes. */
 function isFatalRemote(err: AppError): boolean {
   return err.kind === 'auth' || err.kind === 'network' || err.kind === 'quota';
@@ -209,6 +258,15 @@ function isNotFound(e: unknown): boolean {
  */
 function isSynthesizable(e: LocalEntry): boolean {
   return !!e.analysis && e.transcript.trim() !== '';
+}
+
+/**
+ * L'audio d'une entrée peut-il expirer (rétention) ? Seulement si son contenu ne dépend plus de
+ * lui : analyse faite, et analyse ou transcription présente. Une entrée jamais transcrite (filtres,
+ * quota, pas de clé…) garde son audio : c'est la seule copie de ce qui a été dit.
+ */
+function audioDisposable(e: LocalEntry): boolean {
+  return !e.local.needsAnalysis && (!!e.analysis || e.transcript.trim() !== '');
 }
 
 /** Le jour a-t-il (ou aura-t-il, une fois analysé) de quoi écrire une synthèse ? */
@@ -373,9 +431,63 @@ function normalizeMirrorState(raw: unknown): MirrorState {
 /* ------------------------------------------------------------------ */
 
 export function createSyncEngine(deps: SyncDeps): SyncEngine {
-  const { db, drive, auth, createAi } = deps;
+  const { db, auth, createAi } = deps;
+  const rawDrive = deps.drive;
   const now = deps.now ?? (() => new Date());
   const isOnline = deps.isOnline ?? defaultIsOnline;
+
+  /** Compte Google vérifié pour un jeton (un seul appel `about()` par jeton). */
+  let verified: { token: string; email: string } | null = null;
+  /** Jeton dont le compte est le propriétaire des données : seul autorisé pour Drive ce cycle. */
+  let remoteToken: string | null = null;
+  /** Dernier conflit de compte constaté, et le jeton concerné. */
+  let conflict: { token: string; value: AccountConflict } | null = null;
+
+  /**
+   * Garde-fou : aucun appel Drive (hors `about`) avec un jeton autre que celui vérifié au début
+   * du cycle — les données d'un compte ne partent jamais dans le Drive d'un autre.
+   */
+  function assertSameAccount(): void {
+    const token = auth.getToken();
+    // Sans jeton, le client Drive lève lui-même AppError('auth').
+    if (token !== null && token !== remoteToken) throw new AccountChangedError();
+  }
+
+  const drive: DriveClient = {
+    about: () => rawDrive.about(),
+    async listAppData() {
+      assertSameAccount();
+      return rawDrive.listAppData();
+    },
+    async downloadJson<T>(fileId: string): Promise<T> {
+      assertSameAccount();
+      return rawDrive.downloadJson<T>(fileId);
+    },
+    async downloadBlob(fileId) {
+      assertSameAccount();
+      return rawDrive.downloadBlob(fileId);
+    },
+    async createAppDataFile(name, body, mimeType, appProperties) {
+      assertSameAccount();
+      return rawDrive.createAppDataFile(name, body, mimeType, appProperties);
+    },
+    async updateFileContent(fileId, body, mimeType) {
+      assertSameAccount();
+      return rawDrive.updateFileContent(fileId, body, mimeType);
+    },
+    async deleteFile(fileId) {
+      assertSameAccount();
+      return rawDrive.deleteFile(fileId);
+    },
+    async ensureFolder(name, parentId) {
+      assertSameAccount();
+      return rawDrive.ensureFolder(name, parentId);
+    },
+    async upsertTextFile(parentId, name, content, mimeType, existingId) {
+      assertSameAccount();
+      return rawDrive.upsertTextFile(parentId, name, content, mimeType, existingId);
+    },
+  };
 
   let status: SyncStatus = {
     running: false,
@@ -473,16 +585,61 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
     ctx.needsKey = !key || key === rejectedKey;
   }
 
-  async function patchEntry(
+  /** Lecture-modification-écriture d'une entrée, sérialisée avec celles du contrôleur. */
+  function patchEntry(
     id: string,
     fn: (cur: LocalEntry) => LocalEntry | null,
   ): Promise<LocalEntry | undefined> {
-    const cur = await db.getEntry(id);
-    if (!cur) return undefined;
-    const next = fn(cur);
-    if (!next) return undefined;
-    await db.putEntry(next);
-    return next;
+    return updateEntry(db, id, fn);
+  }
+
+  /** Erreur qui a interrompu les étapes distantes. */
+  function remoteStepsError(ctx: Ctx, e: unknown): void {
+    if (e instanceof AccountChangedError) {
+      // Jeton remplacé pendant le cycle : on recommence, le compte sera revérifié.
+      rerunRequested = true;
+      return;
+    }
+    const err = toAppError(e);
+    if (err.kind === 'auth') markExpired(ctx);
+    else note(ctx, err);
+  }
+
+  /**
+   * Étape 0 — le compte du jeton est-il celui à qui appartiennent les données locales ?
+   * Appareil vierge : le compte est adopté. Autre compte, ou données d'un compte inconnu →
+   * conflit, aucune opération Drive (rien ne part dans le Drive d'un autre compte, aucune
+   * suppression n'est déduite du Drive d'un autre compte).
+   */
+  async function verifyAccount(ctx: Ctx, token: string): Promise<boolean> {
+    let email: string;
+    if (verified && verified.token === token) {
+      email = verified.email;
+    } else {
+      email = (await rawDrive.about()).email.trim();
+      if (!email) {
+        throw new AppError(
+          'other',
+          "Google Drive n'a pas indiqué ton compte : synchronisation suspendue, nouvel essai plus tard.",
+        );
+      }
+      verified = { token, email };
+    }
+    const owner = await withKvLock(db, async () => {
+      const cur = await db.getKv<unknown>(KV.ownerEmail);
+      if (typeof cur === 'string' && cur.trim()) return cur.trim();
+      if (await hasLocalJournal(db)) return undefined; // données d'un compte inconnu
+      await db.setKv(KV.ownerEmail, email);
+      ctx.changed = true;
+      return email;
+    });
+    if (owner !== undefined && sameEmail(owner, email)) {
+      conflict = null;
+      remoteToken = token;
+      return true;
+    }
+    conflict = { token, value: owner === undefined ? { current: email } : { owner, current: email } };
+    return false;
   }
 
   async function getPendingDeletes(): Promise<string[]> {
@@ -532,9 +689,10 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
         if (!snap.audioFileId) {
           throw new AppError('other', "Audio introuvable : l'enregistrement n'est ni sur cet appareil ni dans Drive.");
         }
-        if (!auth.getToken()) {
-          // L'audio est dans Drive : on attend la reconnexion, sans compter d'échec.
-          ctx.needsAuth = true;
+        if (!auth.getToken() || !ctx.remoteReady) {
+          // L'audio est dans Drive : on attend la reconnexion (ou un compte vérifié), sans
+          // compter d'échec.
+          if (!auth.getToken()) ctx.needsAuth = true;
           return null;
         }
         blob = await drive.downloadBlob(snap.audioFileId);
@@ -552,9 +710,11 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
       if (!cur.local.needsAnalysis) return null;
       const local = { ...cur.local, error: err.message, errorKind: err.kind };
       if (countAttempt) {
-        local.attempts = cur.local.attempts + 1;
+        // Quota et réseau sont passagers : seul le délai s'applique, sans user les essais
+        // automatiques (un quota journalier épuisé les consommerait tous en une soirée).
+        if (!isTransient(err)) local.attempts = cur.local.attempts + 1;
         const delay =
-          err.kind === 'safety' ? NEVER_MS : (err.retryAfterMs ?? backoffMs(local.attempts));
+          err.kind === 'safety' ? NEVER_MS : (err.retryAfterMs ?? backoffMs(cur.local.attempts + 1));
         local.retryAfter = new Date(nowMs + delay).toISOString();
       }
       return { ...cur, local };
@@ -616,7 +776,8 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
         const err = toAppError(e);
         if (err.kind === 'auth') {
           // Téléchargement de l'audio refusé : pas la faute de l'entrée.
-          markExpired(ctx);
+          if (e instanceof AccountChangedError) rerunRequested = true;
+          else markExpired(ctx);
           continue;
         }
         if (err.kind === 'invalid-key') {
@@ -673,6 +834,7 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
       // Nouvelle clé reçue d'un autre appareil : l'analyse (étape 1) est déjà passée → on relance.
       if (merged.geminiApiKey.trim() && merged.geminiApiKey.trim() !== oldKey) rerunRequested = true;
     } catch (e) {
+      ctx.settingsPullFailed = true;
       remoteItemError(ctx, e);
     }
   }
@@ -699,24 +861,28 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
             retryable: false,
           });
         }
-        const cur = await db.getEntry(entryId);
-        if (!cur) {
-          if (known) continue; // supprimée localement pendant le téléchargement
-          await db.putEntry({
-            ...remoteEntry,
-            local: {
-              dirty: false,
-              needsAnalysis: !remoteEntry.analysis,
-              hasLocalAudio: false,
-              driveFileId: meta.id,
-              remoteModifiedTime: meta.modifiedTime,
-              attempts: 0,
-            },
-          });
-        } else {
-          await db.putEntry(mergeEntry(cur, remoteEntry, meta));
-        }
-        ctx.changed = true;
+        // Lecture-fusion-écriture sous verrou : une correction simultanée n'est pas écrasée.
+        const written = await withEntryLock(db, async () => {
+          const cur = await db.getEntry(entryId);
+          if (!cur) {
+            if (known) return false; // supprimée localement pendant le téléchargement
+            await db.putEntry({
+              ...remoteEntry,
+              local: {
+                dirty: false,
+                needsAnalysis: !remoteEntry.analysis,
+                hasLocalAudio: false,
+                driveFileId: meta.id,
+                remoteModifiedTime: meta.modifiedTime,
+                attempts: 0,
+              },
+            });
+          } else {
+            await db.putEntry(mergeEntry(cur, remoteEntry, meta));
+          }
+          return true;
+        });
+        if (written) ctx.changed = true;
       } catch (e) {
         ctx.pullIncomplete = true;
         remoteItemError(ctx, e);
@@ -727,19 +893,22 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
     for (const known of locals) {
       const fileId = known.local.driveFileId;
       if (!fileId || remote.has(known.id)) continue;
-      const cur = await db.getEntry(known.id);
-      if (!cur || cur.local.driveFileId !== fileId) continue;
-      if (cur.local.dirty) {
-        // Modifiée ici : on oublie l'ancien fichier, elle sera recréée au push.
-        const local = { ...cur.local };
-        delete local.driveFileId;
-        delete local.remoteModifiedTime;
-        await db.putEntry({ ...cur, local });
-      } else {
-        await db.deleteEntry(cur.id);
-        await db.deleteAudio(cur.id);
-      }
-      ctx.changed = true;
+      const changed = await withEntryLock(db, async () => {
+        const cur = await db.getEntry(known.id);
+        if (!cur || cur.local.driveFileId !== fileId) return false;
+        if (cur.local.dirty) {
+          // Modifiée ici : on oublie l'ancien fichier, elle sera recréée au push.
+          const local = { ...cur.local };
+          delete local.driveFileId;
+          delete local.remoteModifiedTime;
+          await db.putEntry({ ...cur, local });
+        } else {
+          await db.deleteEntry(cur.id);
+          await db.deleteAudio(cur.id);
+        }
+        return true;
+      });
+      if (changed) ctx.changed = true;
     }
   }
 
@@ -914,7 +1083,11 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
             dirty: !sameEntryContent(cur, snap),
           },
         }));
-        if (!saved) await addPendingDeletes([meta.id]);
+        // Entrée supprimée pendant l'envoi : seul un fichier CRÉÉ par cet envoi est à supprimer.
+        // Le fichier existant a déjà été mis en attente par celui qui a supprimé l'entrée ; s'il
+        // ne l'a pas été (base effacée pendant l'envoi), le supprimer ferait disparaître une
+        // entrée intacte de Drive, donc de tous les appareils.
+        if (!saved && meta.id !== snap.local.driveFileId) await addPendingDeletes([meta.id]);
         ctx.changed = true;
       } catch (e) {
         remoteItemError(ctx, e);
@@ -927,15 +1100,15 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
     const entries = await db.listEntries();
     for (const e of entries) {
       if (!e.local.hasLocalAudio || !e.audioFileId || e.local.needsAnalysis) continue;
-      const saved = await patchEntry(e.id, (cur) =>
-        cur.audioFileId && !cur.local.needsAnalysis
-          ? { ...cur, local: { ...cur.local, hasLocalAudio: false } }
-          : null,
-      );
-      if (saved) {
+      // Sous verrou : une demande de nouvelle analyse ne peut pas s'intercaler.
+      const dropped = await withEntryLock(db, async () => {
+        const cur = await db.getEntry(e.id);
+        if (!cur || !cur.audioFileId || cur.local.needsAnalysis) return false;
+        await db.putEntry({ ...cur, local: { ...cur.local, hasLocalAudio: false } });
         await db.deleteAudio(e.id);
-        ctx.changed = true;
-      }
+        return true;
+      });
+      if (dropped) ctx.changed = true;
     }
   }
 
@@ -952,7 +1125,8 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
         );
         const cur = await db.getSynthesis(snap.day);
         if (!cur) {
-          await addPendingDeletes([meta.id]);
+          // Même règle que pour les entrées : seul un fichier créé par cet envoi.
+          if (meta.id !== snap.local.driveFileId) await addPendingDeletes([meta.id]);
         } else {
           const unchanged = stableJson(toRemoteSynthesis(cur)) === stableJson(toRemoteSynthesis(snap));
           await db.putSynthesis({
@@ -1116,11 +1290,13 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
                 break;
               }
               const prevFail = failures[c.day];
-              const attempts = (prevFail && prevFail.sig === c.sig ? prevFail.attempts : 0) + 1;
+              const prevAttempts = prevFail && prevFail.sig === c.sig ? prevFail.attempts : 0;
+              // Quota / réseau : délai seulement, pas de tentative comptée (voir l'analyse).
+              const attempts = prevAttempts + (isTransient(err) ? 0 : 1);
               const delay =
                 err.kind === 'safety' || attempts >= MAX_AUTO_ATTEMPTS
                   ? NEVER_MS
-                  : (err.retryAfterMs ?? backoffMs(attempts));
+                  : (err.retryAfterMs ?? backoffMs(prevAttempts + 1));
               const retryAfter = new Date(nowMs + delay).toISOString();
               failures[c.day] = { sig: c.sig, attempts, retryAfter };
               if (c.forced) doneForced.add(c.day);
@@ -1164,6 +1340,9 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
     if ((await db.getKv<string>(KV.lastHousekeeping)) === today) return;
     const remote = ctx.remote;
     if (!remote) return;
+    // `settings.json` illisible ce cycle : la durée locale peut être celle par défaut (nouvel
+    // appareil) au lieu de celle choisie → on attend un cycle où les réglages sont lus.
+    if (ctx.settingsPullFailed) return;
     setStatus({ phase: 'housekeeping' });
 
     const cutoff = now().getTime() - ctx.settings.audioRetentionDays * DAY_MS;
@@ -1172,27 +1351,51 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
       return !Number.isNaN(t) && t < cutoff;
     });
     let touched = false;
+    /** Fichiers laissés faute de savoir (pull incomplet) : ménage à refaire au prochain cycle. */
+    let deferred = false;
     if (expired.length > 0) {
       const entries = await db.listEntries();
       for (const { meta, entryId } of expired) {
         try {
-          await drive.deleteFile(meta.id);
           const id = entryId ?? entries.find((e) => e.audioFileId === meta.id)?.id;
-          if (!id) continue;
-          const saved = await patchEntry(id, (cur) => {
-            // Un autre fichier audio est référencé : celui-ci n'était qu'un doublon.
-            if (cur.audioFileId && cur.audioFileId !== meta.id) return null;
-            if (cur.audioExpired && !cur.audioFileId && !cur.local.hasLocalAudio) return null;
+          const cur = id !== undefined ? await db.getEntry(id) : undefined;
+          if (cur) {
+            // Un autre fichier audio est référencé : celui-ci n'est qu'un doublon (supprimable).
+            const duplicate = !!cur.audioFileId && cur.audioFileId !== meta.id;
+            // Entrée pas (encore) transcrite : l'audio est la seule copie de son contenu.
+            if (!duplicate && !audioDisposable(cur)) continue;
+          } else if (ctx.pullIncomplete || (id !== undefined && remote.entries.has(id))) {
+            // Entrée inconnue ici mais présente (ou peut-être présente) dans Drive : on ignore
+            // si elle est transcrite → on attend qu'elle soit tirée.
+            deferred = true;
+            continue;
+          }
+          // Sinon : audio expiré d'une entrée transcrite, doublon, ou fichier orphelin.
+          await drive.deleteFile(meta.id);
+          if (id === undefined) continue;
+          const saved = await withEntryLock(db, async () => {
+            const e = await db.getEntry(id);
+            if (!e) return false;
+            if (e.audioFileId && e.audioFileId !== meta.id) return false;
+            if (e.audioExpired && !e.audioFileId && !e.local.hasLocalAudio) return false;
+            if (!audioDisposable(e)) {
+              // Nouvelle analyse demandée pendant la suppression : l'audio local (s'il existe)
+              // reste, et sera renvoyé dans Drive.
+              if (e.audioFileId !== meta.id) return false;
+              await db.putEntry({ ...e, audioFileId: null, local: { ...e.local, dirty: true } });
+              return true;
+            }
             // Champs techniques : `dirty` sans toucher à `updatedAt`.
-            return {
-              ...cur,
+            await db.putEntry({
+              ...e,
               audioFileId: null,
               audioExpired: true,
-              local: { ...cur.local, dirty: true, hasLocalAudio: false },
-            };
+              local: { ...e.local, dirty: true, hasLocalAudio: false },
+            });
+            await db.deleteAudio(id);
+            return true;
           });
           if (saved) {
-            await db.deleteAudio(id);
             ctx.changed = true;
             touched = true;
           }
@@ -1201,7 +1404,7 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
         }
       }
     }
-    await db.setKv(KV.lastHousekeeping, today);
+    if (!deferred) await db.setKv(KV.lastHousekeeping, today);
     if (touched) {
       setStatus({ phase: 'pushing' });
       await pushEntries(ctx);
@@ -1288,6 +1491,7 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
 
   async function cycle(force: boolean): Promise<void> {
     cycleStarted = true;
+    remoteToken = null;
     const ctx: Ctx = {
       force,
       settings: { ...(await safeLoadSettings()) },
@@ -1295,6 +1499,8 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
       needsKey: false,
       changed: false,
       pullIncomplete: false,
+      settingsPullFailed: false,
+      remoteReady: false,
     };
     try {
       refreshKeyFlag(ctx);
@@ -1303,14 +1509,24 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
       await refreshPending();
 
       const online = isOnline();
+      // 0. Compte Google : vérifié avant toute opération Drive.
+      const token = online ? auth.getToken() : null;
+      if (token) {
+        try {
+          ctx.remoteReady = await verifyAccount(ctx, token);
+        } catch (e) {
+          remoteStepsError(ctx, e);
+        }
+      }
+
       // 1. Analyse
       if (online) await stepAnalyze(ctx);
 
-      // 2 → 6 : jeton Google requis
+      // 2 → 6 : jeton Google (du compte propriétaire des données) requis
       if (online) {
         if (!auth.getToken()) {
           ctx.needsAuth = true;
-        } else {
+        } else if (ctx.remoteReady) {
           let remoteOk = false;
           try {
             await stepPull(ctx);
@@ -1320,9 +1536,7 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
             await stepMirror(ctx);
             remoteOk = true;
           } catch (e) {
-            const err = toAppError(e);
-            if (err.kind === 'auth') markExpired(ctx);
-            else note(ctx, err);
+            remoteStepsError(ctx, e);
           }
           // 7. Fin de cycle
           if (remoteOk) {
@@ -1343,11 +1557,15 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
     } catch {
       // ignoré
     }
+    // Le conflit concerne un jeton : il disparaît avec lui (déconnexion, expiration).
+    const tokenNow = auth.getToken();
+    const accountConflict = conflict && conflict.token === tokenNow ? conflict.value : undefined;
     setStatus({
       needsAuth: ctx.needsAuth,
       needsKey: ctx.needsKey,
       lastError: ctx.error?.message,
       lastErrorKind: ctx.error?.kind,
+      accountConflict,
     });
   }
 

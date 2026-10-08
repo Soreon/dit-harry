@@ -53,6 +53,31 @@
     </a>
   {/if}
 
+  {#if app.unsavedRecording}
+    <div class="bar bar-error" role="alert">
+      <Icon name="alert" size={20} />
+      <span class="text">
+        {app.unsavedRecording.downloaded
+          ? 'Audio téléchargé. Libère de la place puis réessaie pour en faire une entrée.'
+          : "Enregistrement pas encore gardé (stockage plein). Libère de la place puis réessaie, ou télécharge l'audio."}
+      </span>
+      <span class="bar-actions">
+        <button type="button" class="btn btn-small btn-secondary" onclick={() => app.retryUnsavedRecording()}>
+          Réessayer
+        </button>
+        {#if app.unsavedRecording.downloaded}
+          <button type="button" class="btn btn-small btn-ghost" onclick={() => app.dismissUnsavedRecording()}>
+            Fermer
+          </button>
+        {:else}
+          <button type="button" class="btn btn-small btn-ghost" onclick={() => app.downloadUnsavedRecording()}>
+            Télécharger
+          </button>
+        {/if}
+      </span>
+    </div>
+  {/if}
+
   {#if !app.online}
     <div class="bar bar-neutral">
       <Icon name="cloud-off" size={20} />
@@ -222,5 +247,13 @@
 
   .bar .btn {
     flex: none;
+  }
+
+  .bar-actions {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
   }
 </style>

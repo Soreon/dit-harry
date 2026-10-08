@@ -262,6 +262,21 @@ export function createLocalDb(name: string = 'dit-harry'): LocalDb {
 
 /** File d'attente par base (même contexte JS : contrôleur et synchro partagent l'objet `db`). */
 const kvQueues = new WeakMap<LocalDb, Promise<void>>();
+/** Idem pour les lectures-modifications-écritures du store `entries`. */
+const entryQueues = new WeakMap<LocalDb, Promise<void>>();
+
+function serialize<T>(queues: WeakMap<LocalDb, Promise<void>>, db: LocalDb, fn: () => Promise<T>): Promise<T> {
+  const prev = queues.get(db) ?? Promise.resolve();
+  const p = prev.then(fn);
+  queues.set(
+    db,
+    p.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return p;
+}
 
 /**
  * Exécute `fn` seule : deux sections `withKvLock` sur la même base ne s'entrelacent jamais.
@@ -272,16 +287,37 @@ const kvQueues = new WeakMap<LocalDb, Promise<void>>();
  * Ne jamais imbriquer deux sections (interblocage) ni y faire d'appel réseau.
  */
 export function withKvLock<T>(db: LocalDb, fn: () => Promise<T>): Promise<T> {
-  const prev = kvQueues.get(db) ?? Promise.resolve();
-  const p = prev.then(fn);
-  kvQueues.set(
-    db,
-    p.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  return p;
+  return serialize(kvQueues, db, fn);
+}
+
+/**
+ * Exécute `fn` seule vis-à-vis des autres sections `withEntryLock` de la même base : les
+ * lectures-modifications-écritures d'entrées du contrôleur ET de la synchro ne s'entrelacent
+ * jamais (sinon une correction écrite entre la lecture et l'écriture de l'autre est écrasée).
+ * Jamais d'appel réseau dedans, jamais de `withEntryLock` imbriqué. Seule imbrication permise :
+ * une section d'entrées peut appeler `withKvLock`/`updateKv` — jamais l'inverse (interblocage).
+ */
+export function withEntryLock<T>(db: LocalDb, fn: () => Promise<T>): Promise<T> {
+  return serialize(entryQueues, db, fn);
+}
+
+/**
+ * Lit l'entrée `id`, calcule la nouvelle version avec `fn` (null = ne rien écrire) et l'écrit,
+ * sous `withEntryLock`. Retourne l'entrée écrite, ou undefined (absente / rien écrit).
+ */
+export function updateEntry(
+  db: LocalDb,
+  id: string,
+  fn: (current: LocalEntry) => LocalEntry | null,
+): Promise<LocalEntry | undefined> {
+  return withEntryLock(db, async () => {
+    const cur = await db.getEntry(id);
+    if (!cur) return undefined;
+    const next = fn(cur);
+    if (!next) return undefined;
+    await db.putEntry(next);
+    return next;
+  });
 }
 
 /** Lit une clé `kv`, calcule la nouvelle valeur avec `fn` et l'écrit, sous `withKvLock`. */

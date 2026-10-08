@@ -29,8 +29,10 @@ const ASSETS_PATH = new URL('assets/', SCOPE).pathname;
 /* ------------------------------------------------------------------ */
 
 self.addEventListener('install', (event) => {
-  self.skipWaiting();
-  event.waitUntil(precache());
+  // Précache atomique : s'il échoue, l'installation échoue, l'ancien worker et son cache
+  // (complet) restent en place, et le navigateur réessaiera à la prochaine visite. Sinon
+  // `activate` supprimerait le dernier cache utilisable hors ligne.
+  event.waitUntil(precache().then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
@@ -48,19 +50,18 @@ self.addEventListener('message', (event) => {
   if (data === 'SKIP_WAITING' || (data && data.type === 'SKIP_WAITING')) self.skipWaiting();
 });
 
-/** Met en cache « ./ » et « ./index.html », puis les fichiers que la page référence. */
+/**
+ * Met en cache les fichiers que la page référence, puis « ./ » et « ./index.html » (en dernier :
+ * le cache n'a jamais de page sans ses scripts). Rejette si la page ou un fichier indispensable
+ * (assets/ : JS, CSS) n'a pas pu être récupéré.
+ */
 async function precache() {
   const cache = await caches.open(CACHE);
-  let res;
-  try {
-    res = await fetch(INDEX_URL, { cache: 'no-cache' });
-  } catch {
-    return; // hors ligne : le cache se remplira à la prochaine visite
-  }
-  if (!isCacheable(res)) return;
+  const res = await fetch(INDEX_URL, { cache: 'no-cache' }); // hors ligne → rejet → install échoue
+  if (!isCacheable(res)) throw new Error(`index.html indisponible (${res.status})`);
   const html = await res.clone().text();
-  await putShell(cache, res);
   await cacheReferencedFiles(cache, html);
+  await putShell(cache, res);
 }
 
 /* ------------------------------------------------------------------ */
@@ -87,7 +88,12 @@ self.addEventListener('fetch', (event) => {
 function handleNavigation(event) {
   const req = event.request;
   let caching = Promise.resolve();
-  const network = fetch(req).then((res) => {
+  // `no-cache` : toujours revalider auprès du serveur (304 si inchangé). Sans cela, le cache
+  // HTTP (GitHub Pages : max-age=600) peut rendre l'ANCIENNE page juste après un déploiement ;
+  // elle remplacerait la nouvelle dans CACHE et pointerait vers des fichiers hashés supprimés
+  // (écran blanc). Avec un `init`, le mode « navigate » devient « same-origin » ; la redirection
+  // reste « manual », donc la réponse reste valable pour cette navigation.
+  const network = fetch(new Request(req, { cache: 'no-cache' })).then((res) => {
     if (isCacheable(res) && isShellUrl(req.url)) {
       // Copie prise avant que la page ne lise le corps ; mise en cache sans retarder la réponse.
       const copy = res.clone();
@@ -181,7 +187,11 @@ async function cachedShell() {
   return (await cache.match(INDEX_URL)) ?? (await cache.match(ROOT_URL));
 }
 
-/** Fichiers de même origine référencés par index.html (scripts, styles, manifeste, icônes). */
+/**
+ * Fichiers de même origine référencés par index.html (scripts, styles, manifeste, icônes).
+ * Rejette si un fichier hashé (assets/ : indispensable au démarrage) manque ; les autres
+ * (icônes, manifeste) seront mis en cache à leur première utilisation.
+ */
 async function cacheReferencedFiles(cache, html) {
   const urls = new Set();
   for (const m of html.matchAll(/\b(?:src|href)\s*=\s*["']([^"'#?]+)["']/g)) {
@@ -196,12 +206,14 @@ async function cacheReferencedFiles(cache, html) {
   }
   await Promise.all(
     [...urls].map(async (url) => {
+      const required = isHashedAsset(url);
       try {
         if (await cache.match(url)) return;
         const res = await fetch(url, { cache: 'no-cache' });
         if (isCacheable(res)) await cache.put(url, res);
-      } catch {
-        // fichier manquant ou hors ligne : il sera mis en cache à la première utilisation
+        else if (required) throw new Error(`${url} indisponible (${res.status})`);
+      } catch (e) {
+        if (required) throw e;
       }
     }),
   );

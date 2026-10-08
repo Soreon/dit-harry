@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AppError } from '../src/lib/errors';
-import { MAX_INLINE_AUDIO_BYTES, createGeminiClient } from '../src/lib/gemini';
+import { MAX_INLINE_AUDIO_BYTES, createGeminiClient, msUntilDailyQuotaReset } from '../src/lib/gemini';
 import {
   ENTRY_AUDIO_PROMPT,
   ENTRY_AUDIO_SCHEMA,
@@ -463,6 +463,22 @@ describe('createGeminiClient — erreurs', () => {
     expect(err.message).toMatch(/restrictions de la clé/);
   });
 
+  it('referrer bloqué : le message donne l’origine à autoriser (le chemin de l’appli n’est jamais envoyé)', async () => {
+    vi.stubGlobal('location', { origin: 'https://soreon.github.io', href: 'https://soreon.github.io/dit-harry/#/' });
+    try {
+      const { err } = await failWith(
+        apiError(403, 'Requests from referer https://soreon.github.io/ are blocked.', 'PERMISSION_DENIED', [
+          { '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_HTTP_REFERRER_BLOCKED' },
+        ]),
+      );
+      expect(err.message).toContain('« https://soreon.github.io/* »');
+      expect(err.message).toMatch(/depuis ce site/); // reconnu par le contrôleur (message précis gardé)
+      expect(err.message).not.toContain('/dit-harry');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('429 + RetryInfo → quota avec retryAfterMs', async () => {
     const details = (delay: string) => [
       { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [] },
@@ -481,6 +497,47 @@ describe('createGeminiClient — erreurs', () => {
     const c = await failWith(apiError(429, 'quota', 'RESOURCE_EXHAUSTED'));
     expect(c.err.kind).toBe('quota');
     expect(c.err.retryAfterMs).toBeUndefined();
+  });
+
+  it('429 quota JOURNALIER (QuotaFailure …PerDay…) → nouvel essai après minuit, heure du Pacifique', async () => {
+    const daily = [
+      {
+        '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+        violations: [
+          {
+            quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests',
+            quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier',
+          },
+        ],
+      },
+      // Le RetryInfo (quelques secondes) ne vaut que pour la minute : il doit être ignoré.
+      { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '42s' },
+    ];
+    const before = Date.now();
+    const { err } = await failWith(apiError(429, 'You exceeded your current quota.', 'RESOURCE_EXHAUSTED', daily));
+    expect(err.kind).toBe('quota');
+    expect(err.message).toMatch(/^Quota quotidien Gemini atteint : reprise automatique vers \d{1,2} h\.$/);
+    const expected = msUntilDailyQuotaReset(before) + 5 * 60_000;
+    expect(err.retryAfterMs).toBeGreaterThan(expected - 5_000);
+    expect(err.retryAfterMs).toBeLessThanOrEqual(expected);
+
+    // Quota par minute : RetryInfo gardé
+    const perMinute = [
+      {
+        '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+        violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }],
+      },
+      { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '42s' },
+    ];
+    const m = await failWith(apiError(429, 'quota', 'RESOURCE_EXHAUSTED', perMinute));
+    expect(m.err.retryAfterMs).toBe(42_000);
+    expect(m.err.message).toBe('Quota Gemini atteint, nouvel essai plus tard.');
+  });
+
+  it('msUntilDailyQuotaReset : temps restant jusqu’à minuit à Los Angeles (heure d’été et d’hiver)', () => {
+    expect(msUntilDailyQuotaReset(Date.UTC(2026, 9, 8, 20, 0, 0))).toBe(11 * 3_600_000); // 13 h PDT
+    expect(msUntilDailyQuotaReset(Date.UTC(2026, 9, 8, 7, 0, 0))).toBe(24 * 3_600_000); // minuit PDT
+    expect(msUntilDailyQuotaReset(Date.UTC(2026, 11, 1, 8, 30, 0))).toBe(23.5 * 3_600_000); // 0 h 30 PST
   });
 
   it('402 (et ancien 429 « prepayment credits are depleted ») → quota « Crédit Gemini épuisé »', async () => {

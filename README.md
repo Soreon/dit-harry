@@ -129,7 +129,7 @@ Chaque push sur `main` lance [la GitHub Action](.github/workflows/deploy.yml) : 
 vérification des types, construction, puis publication sur GitHub Pages. Le service worker
 est renuméroté à chaque déploiement ; l'appli installée se met à jour à l'ouverture suivante.
 
-La mise en place complète (organisation GitHub, projet Google Cloud, clé Gemini,
+La mise en place complète (dépôt GitHub, projet Google Cloud, clé Gemini,
 installation sur Android) est décrite pas à pas dans **[docs/SETUP.md](docs/SETUP.md)**.
 
 ## Structure du projet
