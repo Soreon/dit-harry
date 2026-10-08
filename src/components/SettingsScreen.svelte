@@ -1,12 +1,14 @@
 <script lang="ts">
   import { config } from '../config';
   import { useApp } from '../lib/app.svelte';
+  import { installSectionMode } from '../lib/install';
+  import { install } from '../lib/install.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import { formatRelative, plural } from './helpers';
   import Icon from './Icon.svelte';
   import KeyField from './KeyField.svelte';
 
-  // Réglages : compte, Gemini, sauvegarde, synchronisation, à propos.
+  // Réglages : compte, Gemini, sauvegarde, synchronisation, application, à propos.
   const app = useApp();
   const uid = $props.id();
 
@@ -19,6 +21,7 @@
   let retention = $derived(app.settings.audioRetentionDays);
 
   let confirmSignOut = $state(false);
+  let appTitle = $state<HTMLElement>();
   let clearDevice = $state(false);
   let syncing = $state(false);
   /** Suppressions pas encore faites dans Drive (relu à l'ouverture du dialogue). */
@@ -29,6 +32,7 @@
     app.settings.entryModel === config.defaultEntryModel &&
       app.settings.synthesisModel === config.defaultSynthesisModel,
   );
+  const installMode = $derived(installSectionMode(install));
   const accountLabel = $derived(app.auth.name || app.auth.email || 'Compte Google');
   const initial = $derived((app.auth.name || app.auth.email || '?').charAt(0).toUpperCase());
 
@@ -61,6 +65,13 @@
     const clamped = Math.min(MAX_RETENTION, Math.max(MIN_RETENTION, n));
     retention = clamped;
     if (clamped !== app.settings.audioRetentionDays) await app.saveSettings({ audioRetentionDays: clamped });
+  }
+
+  function installNow(): void {
+    // prompt() d'abord, dans le clic (Chrome exige un appui récent). Le bouton disparaît aussitôt
+    // (événement à usage unique) : le focus va au titre de la section, pas sur <body>.
+    app.installApp();
+    appTitle?.focus({ preventScroll: true });
   }
 
   async function syncNow(): Promise<void> {
@@ -255,6 +266,27 @@
         <Icon name="sync" size={18} /> Synchroniser maintenant
       {/if}
     </button>
+  </section>
+
+  <!-- Application (installation sur l'écran d'accueil) -->
+  <section class="card group" aria-labelledby="{uid}-app">
+    <h2 id="{uid}-app" class="section-title" tabindex="-1" bind:this={appTitle}>Application</h2>
+    {#if installMode === 'installed'}
+      <p class="installed">
+        <Icon name="check" size={18} />
+        <span>Dit Harry est installée sur cet appareil.</span>
+      </p>
+    {:else if installMode === 'prompt'}
+      <button type="button" class="btn btn-primary" onclick={installNow}>
+        <Icon name="download" size={18} /> Installer sur l'écran d'accueil
+      </button>
+      <span class="field-help">Dit Harry s'ouvrira depuis son icône, en plein écran.</span>
+    {:else}
+      <p class="field-help manual">
+        Pour l'installer : menu <strong>⋮</strong> de Chrome → «&nbsp;Installer l'application&nbsp;» (ou
+        «&nbsp;Ajouter à l'écran d'accueil&nbsp;»). Si elle est déjà installée, ouvre-la depuis son icône.
+      </p>
+    {/if}
   </section>
 
   <!-- À propos -->
@@ -452,6 +484,24 @@
 
   .group > .btn {
     align-self: flex-start;
+  }
+
+  /* Titre focalisé par programme (pas un élément interactif) : pas d'anneau. */
+  .section-title[tabindex='-1']:focus {
+    outline: none;
+  }
+
+  .installed {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--success);
+    font-weight: 600;
+  }
+
+  .manual {
+    color: var(--ink);
+    font-size: 0.9375rem;
   }
 
   .about {

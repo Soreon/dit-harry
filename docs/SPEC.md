@@ -43,6 +43,8 @@ src/
     errors.ts          (figé)        AppError
     util.ts            (figé)        dates, ids, signature, base64…
     app.svelte.ts      UI            contrôleur réactif (runes) utilisé par les composants
+    install.svelte.ts  UI            installation PWA : beforeinstallprompt, état réactif
+    install.ts         UI            installation PWA : règles de décision pures
     db.ts              CORE          IndexedDB (createLocalDb)
     settings.ts        CORE          réglages : défauts, chargement, sauvegarde, fusion
     sync.ts            CORE          moteur de synchronisation (createSyncEngine)
@@ -58,6 +60,7 @@ src/
     mock/*.ts          INFRA         auth / drive / gemini / recorder simulés
 public/
   sw.js, manifest.webmanifest, icons/*        INFRA
+  screenshots/*.png                           INFRA  captures du manifeste (mode démo)
 scripts/gen-icons.mjs                         INFRA
 .github/workflows/deploy.yml                  INFRA
 README.md, docs/SETUP.md                      INFRA
@@ -424,14 +427,21 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
   `#/reglages`. Barre d'onglets en bas : Aujourd'hui · Journal · Réglages.
 - **Accueil (non connecté)** : nom, accroche, bouton « Se connecter avec Google ». Si l'id client
   manque : message de configuration. Si l'appareil garde le journal d'un compte : « Ce téléphone
-  garde le journal de {email} : connecte-toi avec ce compte pour le retrouver. »
+  garde le journal de {email} : connecte-toi avec ce compte pour le retrouver. » Bouton
+  secondaire « Installer Dit Harry » **sous l'accroche** si l'installation est possible (§11) :
+  visible sans défiler sur un petit téléphone (mise en page resserrée si hauteur ≤ 760 px).
 - **Clé Gemini manquante** : écran d'accueil de réglage (coller la clé, lien
   https://aistudio.google.com/apikey, bouton « Vérifier », « Plus tard »). Jamais affiché pendant
   un enregistrement (il remplacerait le bouton Arrêter).
 - Changement d'écran : le focus passe au `<h1>` du nouvel écran (`tabindex=-1`), sauf si un
   champ de saisie a déjà le focus ou qu'un dialogue est ouvert (lecteurs d'écran).
 - Champs et interrupteur éteint : bordure/piste `--control-border` (≥ 3:1, WCAG 1.4.11).
-- **Aujourd'hui** : date du jour ; gros bouton rond d'enregistrement (appui = démarrer, appui =
+- **Aujourd'hui** : date du jour ; carte discrète « Installe Dit Harry sur ton écran d'accueil »
+  (« Installer » + × « Masquer la proposition d'installation ») si l'installation est possible,
+  **sous le contenu, juste au-dessus du bouton d'enregistrement** (son arrivée tardive ne déplace
+  rien de ce qui est à l'écran : pas d'appui détourné), fondu sans animation de hauteur, jamais
+  pendant un enregistrement, revient 30 jours après une fermeture ou un refus dans la fenêtre de
+  Chrome (`dh.ui.installDismissedAt`) ; gros bouton rond d'enregistrement (appui = démarrer, appui =
   arrêter), anneau animé selon le niveau, chrono, bouton « Annuler » pendant l'enregistrement ;
   bouton « Écrire » (saisie texte) ; liste des entrées du jour (heure, titre ou « Analyse en
   cours… », emoji d'humeur, résumé, statut : en attente / analyse / non envoyé / erreur + Réessayer).
@@ -444,7 +454,9 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
   lieux, à faire), Réessayer, Supprimer (confirmation).
 - **Réglages** : compte (email, Se déconnecter, option « Effacer les données de cet appareil »),
   clé Gemini (masquée, Vérifier), modèles d'entrée/synthèse, copie visible Drive (on/off),
-  conservation audio (jours), Exporter (zip), Synchroniser maintenant + dernier cycle, version.
+  conservation audio (jours), Exporter (zip), Synchroniser maintenant + dernier cycle,
+  Application (« Dit Harry est installée sur cet appareil. », sinon bouton « Installer sur l'écran
+  d'accueil », sinon mode d'emploi du menu ⋮ de Chrome), version.
 - **Bandeau d'état** (haut) : hors ligne ; session expirée + « Se reconnecter » ; clé manquante ;
   synchro en cours / N en attente.
 - Humeur → emoji : -2 😞, -1 🙁, 0 😐, 1 🙂, 2 😄.
@@ -452,7 +464,23 @@ distantes. Erreur réseau → arrêt, `lastError`. Erreur sur un élément → o
 ## 11. PWA
 
 - `manifest.webmanifest` : URLs **relatives** (`start_url: "./"`, `scope: "./"`), `display:
-  standalone`, `lang: fr`, icônes 192/512 PNG + 512 maskable + SVG.
+  standalone`, `lang: fr`, icônes 192/512 PNG + 512 maskable + SVG, captures d'écran `narrow`
+  780×1688 (`public/screenshots/`, tirées du mode démo) pour la fenêtre d'installation enrichie
+  d'Android. **`id`** ajouté au build par `vite.config.ts` = `base` (`/dit-harry/`) : le
+  navigateur résout `id` contre l'**origine** de `start_url`, donc `"./"` désignerait
+  `https://soreon.github.io/`, une autre appli ; `base` redonne exactement l'identité d'avant
+  (`start_url` résolu). Ne pas écrire d'`id` relatif dans le fichier source.
+- Installation dans l'appli (`lib/install.svelte.ts`, règles pures dans `lib/install.ts`) :
+  `beforeinstallprompt` capturé dans `main.ts` **avant le montage**, `preventDefault()` (pas de
+  mini-barre de Chrome, qui disparaît des mois une fois fermée), événement gardé pour les boutons ;
+  `prompt()` appelé **dans le clic** (`app.installApp()`), à usage unique. Refus dans la fenêtre
+  de Chrome → carte d'Aujourd'hui en sommeil 30 jours comme la croix (Chrome renvoie aussitôt un
+  `beforeinstallprompt`) ; accueil et réglages gardent leur bouton. Le bouton activé disparaît :
+  le focus va au `<h1>` (Aujourd'hui), au titre « Application » (réglages) ou au bouton de
+  connexion (accueil), jamais sur `<body>`. `appinstalled` →
+  installée ; fenêtre d'appli détectée par `(display-mode: standalone)` ou un référent
+  `android-app://`. Acceptée → toast « Dit Harry est installée. Tu la trouveras sur ton écran
+  d'accueil. ».
 - `sw.js` (écrit à la main, sans Workbox) : enregistré depuis `main.ts` en production avec
   `import.meta.env.BASE_URL + 'sw.js'`. Navigation → réseau d'abord **en `cache: 'no-cache'`**
   (jamais une ancienne page du cache HTTP après un déploiement), repli sur `index.html` en

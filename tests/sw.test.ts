@@ -120,6 +120,25 @@ describe('sw.js', () => {
     expect(sw.self.skipWaiting).not.toHaveBeenCalled();
   });
 
+  it('installation : les captures d’écran du manifeste ne sont pas précachées', async () => {
+    const fetched: string[] = [];
+    const manifestUrl = `${SCOPE}manifest.webmanifest`;
+    const html = HTML.replace('</head>', '<link rel="manifest" href="./manifest.webmanifest"></head>');
+    const sw = loadSw(async (input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      fetched.push(url);
+      if (url === INDEX_URL) return basic(html);
+      if (url === manifestUrl) return basic(JSON.stringify({ screenshots: [{ src: 'screenshots/journal.png' }] }));
+      return basic('contenu');
+    });
+    let install: Promise<unknown> | undefined;
+    sw.listeners.install?.({ waitUntil: (p: Promise<unknown>) => (install = p) });
+    await install;
+    const [store] = [...sw.stores.values()];
+    expect(store?.has(manifestUrl)).toBe(true);
+    expect(fetched.some((u) => u.includes('/screenshots/'))).toBe(false);
+  });
+
   it('installation hors ligne : échec (pas d’activation avec un cache vide)', async () => {
     const sw = loadSw(async () => {
       throw new TypeError('Failed to fetch');

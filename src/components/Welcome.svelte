@@ -1,13 +1,29 @@
 <script lang="ts">
+  import { fade } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { config } from '../config';
   import { useApp } from '../lib/app.svelte';
+  import { canOfferInstall } from '../lib/install';
+  import { install } from '../lib/install.svelte';
   import Icon from './Icon.svelte';
 
-  // Accueil non connecté : présentation + connexion Google.
+  // Accueil non connecté : présentation + connexion Google (+ installation si Chrome la propose).
   const app = useApp();
 
   const missingClientId = !config.mock && config.googleClientId.trim() === '';
   const busy = $derived(app.auth.status === 'signing-in' || app.auth.status === 'loading');
+  const offerInstall = $derived(canOfferInstall(install));
+
+  let title = $state<HTMLElement>();
+  let signInButton = $state<HTMLButtonElement>();
+
+  function installNow(): void {
+    // prompt() d'abord, dans le clic (Chrome exige un appui récent). Le bouton disparaît aussitôt
+    // (événement à usage unique) : le focus passe à la connexion, sinon il retomberait sur <body>.
+    app.installApp();
+    if (signInButton?.isConnected && !signInButton.disabled) signInButton.focus({ preventScroll: true });
+    else title?.focus({ preventScroll: true });
+  }
 </script>
 
 <div class="welcome">
@@ -15,8 +31,20 @@
     <div class="mark" aria-hidden="true">
       <Icon name="mic" size={40} />
     </div>
-    <h1>Dit Harry</h1>
+    <h1 tabindex="-1" bind:this={title}>Dit Harry</h1>
     <p class="tagline">Ton journal intime, à voix haute.</p>
+    <!-- Sous l'accroche, visible sans faire défiler même sur un petit téléphone (barre d'adresse
+         de Chrome comprise) : en bas de l'écran, personne ne la voyait. -->
+    {#if offerInstall}
+      <button
+        type="button"
+        class="btn btn-secondary install"
+        transition:fade={{ duration: prefersReducedMotion.current ? 0 : 160 }}
+        onclick={installNow}
+      >
+        <Icon name="download" size={18} /> Installer Dit Harry
+      </button>
+    {/if}
   </div>
 
   <ul class="points">
@@ -56,7 +84,13 @@
           </span>
         </p>
       {/if}
-      <button type="button" class="btn btn-primary btn-block big" disabled={busy} onclick={() => app.signIn()}>
+      <button
+        type="button"
+        class="btn btn-primary btn-block big"
+        disabled={busy}
+        bind:this={signInButton}
+        onclick={() => app.signIn()}
+      >
         {#if busy}
           <span class="spinner" aria-hidden="true"></span>
           {app.auth.status === 'loading' ? 'Chargement…' : 'Connexion…'}
@@ -116,6 +150,10 @@
     color: var(--ink-muted);
   }
 
+  .install {
+    margin-top: 6px;
+  }
+
   .points {
     list-style: none;
     margin: 0;
@@ -165,5 +203,52 @@
 
   .owner {
     overflow-wrap: anywhere;
+  }
+
+  /* Petits téléphones (≈ 360×740, moins la barre d'adresse) : tout tient sur un écran,
+     connexion comprise, même avec la mention du propriétaire de l'appareil. */
+  @media (max-height: 760px) {
+    .welcome {
+      gap: 20px;
+      padding-top: calc(20px + var(--safe-top));
+      padding-bottom: calc(20px + var(--safe-bottom));
+    }
+
+    .hero {
+      gap: 6px;
+    }
+
+    .mark {
+      width: 64px;
+      height: 64px;
+      box-shadow: 0 0 0 8px var(--accent-soft);
+      margin-bottom: 12px;
+    }
+
+    h1 {
+      font-size: 2.1rem;
+    }
+
+    .tagline {
+      font-size: 1.1rem;
+    }
+
+    .points {
+      gap: 10px;
+      font-size: 0.9375rem;
+    }
+
+    .bullet {
+      width: 32px;
+      height: 32px;
+    }
+
+    .points li span:last-child {
+      padding-top: 4px;
+    }
+
+    .actions {
+      gap: 10px;
+    }
   }
 </style>

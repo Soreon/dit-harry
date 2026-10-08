@@ -37,6 +37,22 @@
       "purpose": "any"
     }
   ],
+  "screenshots": [
+    {
+      "src": "screenshots/aujourdhui.png",
+      "sizes": "780x1688",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Aujourd'hui : un appui pour dicter, et les entrées du jour déjà résumées"
+    },
+    {
+      "src": "screenshots/journal.png",
+      "sizes": "780x1688",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Journal : l'humeur des 30 derniers jours et la synthèse de chaque journée"
+    }
+  ],
   "shortcuts": [
     {
       "name": "Journal",

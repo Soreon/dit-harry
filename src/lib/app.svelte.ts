@@ -8,6 +8,7 @@ import { config } from '../config';
 import { buildExportZip, downloadBlob } from './backup';
 import { updateEntry, updateKv, withEntryLock, withKvLock } from './db';
 import { toAppError } from './errors';
+import { promptInstall } from './install.svelte';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings as storeSettings } from './settings';
 import { KV_DEVICE_OWNER, hasLocalJournal, pendingCountOf } from './sync';
 import type {
@@ -994,6 +995,28 @@ export class AppController {
     } finally {
       this.exporting = false;
     }
+  }
+
+  /* ================================================================== */
+  /* Installation (PWA)                                                  */
+  /* ================================================================== */
+
+  /**
+   * Boutons « Installer » : à appeler directement dans `onclick`. La fenêtre de Chrome s'ouvre
+   * avant toute attente (elle exige un appui récent) ; l'issue est annoncée ensuite.
+   */
+  installApp(): void {
+    void promptInstall().then((outcome) => {
+      if (outcome === 'accepted') {
+        this.toast("Dit Harry est installée. Tu la trouveras sur ton écran d'accueil.", 'success', 6000);
+      } else if (outcome === 'unavailable') {
+        this.toast(
+          "Chrome n'a pas pu proposer l'installation. Passe par son menu ⋮ → « Installer l'application ».",
+          'info',
+          6500,
+        );
+      }
+    });
   }
 
   /* ================================================================== */

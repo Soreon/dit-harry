@@ -176,8 +176,18 @@ Au bout de 2 à 3 minutes, l'appli est en ligne sur **`https://soreon.github.io/
 2. **Se connecter avec Google** → choisis ton compte → sur l'écran d'autorisation, **coche les
    deux cases Google Drive** → **Continuer**.
 3. Colle la clé Gemini (étape 6) si ce n'est pas déjà fait.
-4. Menu **⋮** de Chrome → **Installer l'application** (ou **Ajouter à l'écran d'accueil** →
-   **Installer**). L'icône Dit Harry apparaît sur l'écran d'accueil.
+4. Installe l'appli : touche **Installer** dans la carte « Installe Dit Harry sur ton écran
+   d'accueil » (en haut de l'écran Aujourd'hui), ou **Réglages** → **Application** →
+   **Installer sur l'écran d'accueil** (aussi **Installer Dit Harry** sur l'écran de connexion)
+   → Chrome affiche sa fenêtre d'installation, avec deux captures de l'appli → **Installer**.
+   L'icône Dit Harry apparaît sur l'écran d'accueil.
+   - Pas de bouton ? Chrome ne le permet pas encore (il propose l'installation après quelques
+     secondes sur la page, parfois seulement à la visite suivante) ou l'appli est déjà installée.
+     Passe alors par le menu **⋮** de Chrome → **Installer l'application** (ou **Ajouter à
+     l'écran d'accueil** → **Installer**). Si le menu affiche **Ouvrir dans l'application**,
+     elle est déjà installée.
+   - La carte fermée avec **×** revient au bout de 30 jours ; le bouton des réglages reste
+     disponible.
 5. Ouvre Dit Harry depuis l'icône et fais un premier enregistrement : Chrome demande l'accès au
    **micro** → **Autoriser**.
 
@@ -207,6 +217,19 @@ npm run dev           # http://localhost:5173
 - Le mode démo et le vrai mode utilisent des bases locales différentes : pas de mélange.
 
 ## 9. En cas de problème
+
+**Le menu ⋮ de Chrome dit « Cette appli est déjà installée » puis « Impossible d'ouvrir
+l'application », alors qu'elle ne l'est pas.**
+Constaté le 2026-10-08 sur Pixel 9 Pro (Android 17, Chrome 154) : une autre appli web installée
+depuis la même origine `soreon.github.io` (yt-dashboard) semble tromper la fenêtre « Installer et
+créer un raccourci » du menu. Le mécanisme officiel d'installation fonctionne, lui : utilise le
+bouton **Installer** de Dit Harry (carte Aujourd'hui, écran de connexion ou **Réglages** →
+**Application**). Vérification possible : `chrome://webapks` liste les applis réellement
+installées.
+
+**Chrome ne propose jamais l'installation de lui-même.**
+Après plusieurs refus de suite (sur n'importe quel site), Chrome cesse un temps de proposer
+l'installation. Les boutons **Installer** de Dit Harry ne sont pas concernés.
 
 **Rien ne se passe en touchant « Se connecter » / popup bloquée.**
 Chrome n'ouvre la fenêtre Google que juste après un appui. Réessaie en touchant une seule

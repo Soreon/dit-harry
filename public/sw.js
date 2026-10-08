@@ -5,6 +5,8 @@
  * - Fichiers de l'appli (même origine, GET) : cache d'abord, puis réseau (et mise en cache).
  *   Les fichiers hashés de Vite (assets/) ne changent jamais ; les autres (manifeste, icônes)
  *   sont servis depuis le cache puis rafraîchis en arrière-plan.
+ * - Précache : seulement ce que index.html référence. Le manifeste n'est pas analysé : ses
+ *   captures d'écran (screenshots/, fenêtre d'installation) ne sont mises en cache qu'à la demande.
  * - JAMAIS de cache pour les autres origines (Google, Gemini) ni pour les requêtes non-GET :
  *   le navigateur les traite normalement.
  * - BUILD_ID est remplacé à chaque déploiement par la GitHub Action (.github/workflows/deploy.yml) :

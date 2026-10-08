@@ -1,6 +1,10 @@
 import './app.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
+import { initInstall } from './lib/install.svelte';
+
+// Avant le montage : `beforeinstallprompt` ne se rattrape pas s'il est manqué.
+initInstall();
 
 const target = document.getElementById('app');
 if (!target) throw new Error('Élément #app introuvable');

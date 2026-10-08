@@ -2,6 +2,7 @@
   import { useApp } from '../lib/app.svelte';
   import EntryCard from './EntryCard.svelte';
   import { formatDayHeading, hrefDay, plural } from './helpers';
+  import InstallCard from './InstallCard.svelte';
   import RecorderDock from './RecorderDock.svelte';
   import TextEntrySheet from './TextEntrySheet.svelte';
 
@@ -9,6 +10,7 @@
   const app = useApp();
 
   let writing = $state(false);
+  let title = $state<HTMLElement>();
 
   const entries = $derived(app.todayEntries);
   const greeting = $derived.by(() => {
@@ -23,7 +25,7 @@
 <section class="screen today" aria-labelledby="today-title">
   <header class="head">
     <p class="kicker">{greeting}</p>
-    <h1 id="today-title">{formatDayHeading(app.today, app.today)}</h1>
+    <h1 id="today-title" tabindex="-1" bind:this={title}>{formatDayHeading(app.today, app.today)}</h1>
   </header>
 
   {#if !app.ready}
@@ -47,6 +49,10 @@
       {/each}
     </ol>
   {/if}
+
+  <!-- Sous le contenu : son arrivée tardive ne déplace ni la liste ni le bouton d'enregistrement.
+       Elle disparaît sous le doigt : le focus revient au titre (sinon il retombe sur <body>). -->
+  <InstallCard onhide={() => title?.focus({ preventScroll: true })} />
 
   <RecorderDock onwrite={() => (writing = true)} />
 </section>
