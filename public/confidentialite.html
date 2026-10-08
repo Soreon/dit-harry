@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'" />
+    <meta name="description" content="Politique de confidentialité de Dit Harry, journal intime vocal personnel." />
+    <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+    <title>Dit Harry — Confidentialité</title>
+    <style>
+      :root {
+        --bg: #f6f1e9;
+        --ink: #2b2622;
+        --muted: #6b6159;
+        --accent: #b5482f;
+        --line: #e2d8ca;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1c1915;
+          --ink: #f1e9dd;
+          --muted: #b3a798;
+          --accent: #ec8a6f;
+          --line: #3a332b;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 17px/1.6 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+      main {
+        max-width: 680px;
+        margin: 0 auto;
+        padding: 32px 16px 64px;
+      }
+      h1,
+      h2 {
+        font-family: ui-serif, 'Iowan Old Style', Georgia, serif;
+        line-height: 1.25;
+      }
+      h1 {
+        font-size: 2rem;
+        margin: 0 0 4px;
+      }
+      h2 {
+        font-size: 1.25rem;
+        margin: 32px 0 8px;
+        padding-top: 16px;
+        border-top: 1px solid var(--line);
+      }
+      p.meta {
+        color: var(--muted);
+        margin: 0 0 24px;
+      }
+      a {
+        color: var(--accent);
+      }
+      code {
+        font-size: 0.9em;
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Dit Harry — Confidentialité</h1>
+      <p class="meta">Dernière mise à jour : 8 octobre 2026</p>
+
+      <p>
+        Dit Harry est un journal intime vocal <strong>personnel</strong> : une application web
+        statique (sans serveur) publiée sur <a href="./">soreon.github.io/dit-harry</a>, dont le
+        code source est public sur
+        <a href="https://github.com/Soreon/dit-harry">github.com/Soreon/dit-harry</a>. Cette page
+        explique quelles données l'application utilise et où elles vont.
+      </p>
+
+      <h2>Ce que l'application ne fait pas</h2>
+      <p>
+        Dit Harry n'a <strong>aucun serveur</strong> : l'auteur de l'application ne reçoit, ne
+        stocke et ne peut lire aucune de tes données. Pas de compte propre à l'appli, pas de
+        cookies de suivi, pas de statistiques d'usage, pas de publicité, aucune vente ni partage
+        de données.
+      </p>
+
+      <h2>Données Google utilisées</h2>
+      <p>La connexion Google demande deux autorisations Google Drive, et rien d'autre :</p>
+      <ul>
+        <li>
+          <code>drive.appdata</code> — un dossier caché, réservé à l'application, dans
+          <strong>ton</strong> Google Drive. Il contient tes entrées (transcriptions, analyses),
+          les synthèses quotidiennes, les enregistrements audio et tes réglages.
+        </li>
+        <li>
+          <code>drive.file</code> — uniquement les fichiers créés par l'application : une copie
+          lisible de ton journal en Markdown, dans un dossier « Dit Harry » de ton Drive.
+          L'application ne voit aucun autre fichier de ton Drive.
+        </li>
+      </ul>
+      <p>
+        L'application lit aussi ton adresse e-mail et ton nom (via l'API Drive) uniquement pour
+        les afficher et vérifier que le journal présent sur l'appareil appartient bien au compte
+        connecté.
+      </p>
+
+      <h2>Traitement par Gemini</h2>
+      <p>
+        Pour transcrire et analyser tes entrées, l'application envoie l'audio et le texte
+        directement depuis ton appareil à l'API Gemini de Google, avec
+        <strong>ta propre clé</strong> Gemini. Ce traitement est soumis aux
+        <a href="https://ai.google.dev/gemini-api/terms">conditions de l'API Gemini</a> : selon
+        l'offre utilisée et ton pays, Google peut conserver ou utiliser ces contenus comme
+        décrit dans ces conditions.
+      </p>
+
+      <h2>Données sur ton appareil</h2>
+      <p>
+        Le navigateur garde une copie locale du journal (IndexedDB) pour fonctionner hors
+        ligne, ainsi que ta clé Gemini et ton jeton de connexion Google (valable une heure). Ces
+        données restent sur l'appareil ; « Effacer les données de cet appareil », dans les
+        réglages de l'application, les supprime.
+      </p>
+
+      <h2>Conservation et suppression</h2>
+      <ul>
+        <li>Les enregistrements audio sont supprimés automatiquement après 365 jours (réglable).</li>
+        <li>Tu peux supprimer une entrée à tout moment depuis l'application.</li>
+        <li>
+          Pour tout supprimer : Google Drive → Paramètres → Gérer les applications → Dit Harry →
+          « Supprimer les données d'application masquées », puis supprimer le dossier
+          « Dit Harry » de ton Drive.
+        </li>
+        <li>
+          Pour retirer l'accès de l'application à ton compte :
+          <a href="https://myaccount.google.com/connections">myaccount.google.com/connections</a>.
+        </li>
+      </ul>
+
+      <h2>Règles d'utilisation des données Google</h2>
+      <p>
+        L'utilisation et le transfert par Dit Harry des informations reçues des API Google
+        respectent le
+        <a href="https://developers.google.com/terms/api-services-user-data-policy"
+          >Règlement sur les données utilisateur des services d'API Google</a
+        >, y compris les exigences d'utilisation limitée (<em>Limited Use</em>). Ces données ne
+        servent qu'au fonctionnement du journal pour toi.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        Pour toute question :
+        <a href="https://github.com/Soreon/dit-harry/issues">github.com/Soreon/dit-harry/issues</a>.
+      </p>
+    </main>
+  </body>
+</html>
