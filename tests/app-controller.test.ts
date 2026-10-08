@@ -4,9 +4,11 @@ import { AppError } from '../src/lib/errors';
 import { AppController } from '../src/lib/app.svelte';
 import { KV_LOCK_CONFIG, hashPassphrase } from '../src/lib/lock';
 import { createSimulatedAuthenticator } from '../src/lib/mock/passkey';
+import { addDays, dayKey } from '../src/lib/util';
 import type {
   AuthService,
   AuthState,
+  DayMention,
   DriveClient,
   LocalDb,
   LocalEntry,
@@ -639,6 +641,159 @@ describe('AppController', () => {
     await app.adoptDeviceData();
     expect(await db.getKv('device.ownerEmail')).toBe('moi@exemple.fr');
     expect(runs.length).toBe(before + 1);
+    app.destroy();
+  });
+});
+
+describe('AppController — notes d’autres jours', () => {
+  /** Entrée du jour `day`, analysée, avec ses mentions. */
+  function withMentions(id: string, day: string, mentions: DayMention[]): LocalEntry {
+    const iso = new Date(`${day}T09:00:00`).toISOString();
+    return {
+      id,
+      day,
+      createdAt: iso,
+      updatedAt: iso,
+      source: 'text',
+      transcript: 'Texte.',
+      analysis: {
+        title: 'Titre',
+        summary: '',
+        mood: { score: 0, label: 'neutre' },
+        themes: [],
+        people: [],
+        places: [],
+        todos: [],
+        mentions,
+      },
+      analyzedAt: iso,
+      local: { dirty: false, needsAnalysis: false, hasLocalAudio: false, attempts: 0 },
+    };
+  }
+
+  it('gestes : choisir, déplacer, modifier, retirer, rétablir — sans toucher updatedAt, entrée à renvoyer', async () => {
+    const { services, db, runs } = makeServices();
+    const today = dayKey();
+    const proposal: DayMention = {
+      id: 'p1',
+      kind: 'past',
+      day: '',
+      when: 'le week-end dernier',
+      text: 'Mer.',
+      status: 'proposed',
+      choices: [addDays(today, -5), addDays(today, -4)],
+    };
+    const auto: DayMention = { id: 'a1', kind: 'past', day: addDays(today, -2), when: 'avant-hier', text: 'Dîner.', status: 'auto' };
+    const original = withMentions('e1', today, [proposal, auto]);
+    await db.putEntry(original);
+    const app = new AppController(services);
+    await app.start();
+    const mentionsNow = async () => (await db.getEntry('e1'))?.analysis?.mentions ?? [];
+
+    let before = runs.length;
+    expect(await app.setMentionDay('e1', 'p1', addDays(today, -4))).toBe(true);
+    expect((await mentionsNow())[0]).toEqual({
+      id: 'p1',
+      kind: 'past',
+      day: addDays(today, -4),
+      when: 'le week-end dernier',
+      text: 'Mer.',
+      status: 'confirmed',
+      // Horodatage du geste (départage deux appareils à la synchro)
+      decidedAt: expect.any(String),
+    });
+    expect(runs.length).toBe(before + 1);
+
+    // Déplacer vers un jour à venir : devient « prévu »
+    expect(await app.setMentionDay('e1', 'a1', addDays(today, 3))).toBe(true);
+    expect((await mentionsNow())[1]).toMatchObject({ day: addDays(today, 3), kind: 'future', status: 'confirmed' });
+    expect(app.toasts.at(-1)?.message).toMatch(/^Prévu le /);
+    // Jour même ou hors fenêtre : refusé
+    expect(await app.setMentionDay('e1', 'a1', today)).toBe(false);
+    expect(await app.setMentionDay('e1', 'a1', addDays(today, 90))).toBe(false);
+    expect(app.toasts.at(-1)?.kind).toBe('error');
+
+    expect(await app.editMentionText('e1', 'a1', '  Dîner chez Hugo.  ')).toBe(true);
+    expect((await mentionsNow())[1]?.text).toBe('Dîner chez Hugo.');
+    expect(await app.editMentionText('e1', 'a1', '   ')).toBe(false);
+
+    before = runs.length;
+    expect(await app.dismissMention('e1', 'a1')).toBe(true);
+    expect((await mentionsNow())[1]?.status).toBe('dismissed');
+    expect(app.dayLinks.get(addDays(today, 3))).toBeUndefined();
+    expect(await app.dismissMention('e1', 'a1')).toBe(false);
+    expect(await app.restoreMention('e1', 'a1')).toBe(true);
+    expect((await mentionsNow())[1]?.status).toBe('confirmed');
+    expect(app.dayLinks.get(addDays(today, 3))?.map((l) => l.ref)).toEqual(['e1/a1']);
+    expect(runs.length).toBe(before + 2);
+
+    const saved = await db.getEntry('e1');
+    expect(saved?.updatedAt).toBe(original.updatedAt);
+    expect(saved?.local.dirty).toBe(true);
+    // Mention inconnue : rien
+    expect(await app.dismissMention('e1', 'zz')).toBe(false);
+    app.destroy();
+  });
+
+  it('dérivés : prévu aujourd’hui, jours à venir, désactivation (masqué, pas effacé)', async () => {
+    const { services, db } = makeServices();
+    const today = dayKey();
+    await db.putEntry(
+      withMentions('src', addDays(today, -1), [
+        { id: 't', kind: 'future', day: today, when: 'demain', text: 'Dentiste.', status: 'auto' },
+        { id: 'u', kind: 'future', day: addDays(today, 5), when: 'dans six jours', text: 'Concert.', status: 'auto' },
+        { id: 'v', kind: 'past', day: addDays(today, -3), when: 'avant-hier', text: 'Dîner.', status: 'auto' },
+      ]),
+    );
+    const app = new AppController(services);
+    await app.start();
+    expect(app.todayPlanned.map((l) => l.ref)).toEqual(['src/t']);
+    expect(app.upcomingDays.map((g) => g.day)).toEqual([addDays(today, 5)]);
+    expect(app.getDay(addDays(today, -3)).links?.map((l) => l.ref)).toEqual(['src/v']);
+
+    await app.saveSettings({ dayLinks: 'off' }, true);
+    expect(app.dayLinksOn).toBe(false);
+    expect(app.todayPlanned).toEqual([]);
+    expect(app.upcomingDays).toEqual([]);
+    expect((await db.getEntry('src'))?.analysis?.mentions).toHaveLength(3);
+    app.destroy();
+  });
+
+  it('analyse terminée pendant la session : un toast « Noté aussi au … »', async () => {
+    const { services, db } = makeServices();
+    const today = dayKey();
+    // Entrée analysée AVANT la session : pas d'annonce au chargement
+    await db.putEntry(withMentions('old', today, [{ id: 'o', kind: 'past', day: addDays(today, -1), when: 'hier', text: 'x', status: 'auto' }]));
+    const app = new AppController(services);
+    await app.start();
+    expect(app.toasts.some((t) => t.message.startsWith('Noté aussi'))).toBe(false);
+
+    const fresh = withMentions('new', today, [
+      { id: 'n', kind: 'past', day: addDays(today, -2), when: 'avant-hier', text: 'Dîner.', status: 'auto' },
+      { id: 'p', kind: 'past', day: '', when: 'le week-end dernier', text: 'Mer.', status: 'proposed', choices: [addDays(today, -6)] },
+    ]);
+    fresh.analyzedAt = new Date(Date.now() + 1000).toISOString();
+    await db.putEntry(fresh);
+    await app.reload();
+    expect(app.toasts.at(-1)?.message).toMatch(/^Noté aussi au .+\. Un autre jour est mentionné : choisis-le dans l’entrée\.$/);
+    app.destroy();
+  });
+
+  it('retour depuis un jour mis en évidence (#/jour/…?e=…) : l’historique est utilisé', async () => {
+    const { services } = makeServices();
+    const back = vi.fn();
+    vi.stubGlobal('history', { back });
+    const app = new AppController(services);
+    await app.start();
+    location.hash = '#/jour/2026-10-06?e=src';
+    window.dispatchEvent(new Event('hashchange'));
+    location.hash = '#/entree/src';
+    window.dispatchEvent(new Event('hashchange'));
+    expect(app.route).toEqual({ name: 'entry', id: 'src' });
+    app.goUp('#/jour/2026-10-06');
+    expect(back).toHaveBeenCalledTimes(1);
+    app.goUp('#/journal');
+    expect(location.hash).toBe('#/journal');
     app.destroy();
   });
 });

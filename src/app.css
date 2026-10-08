@@ -532,6 +532,24 @@ button:disabled {
   }
 }
 
+/* Élément mis en évidence en arrivant sur un jour (`#/jour/…?e=…`) : entrée ou note d'un autre jour */
+.flash-target {
+  border-radius: var(--radius);
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+  animation: flash-fade 2.6s ease-out forwards;
+}
+
+@keyframes flash-fade {
+  0%,
+  60% {
+    outline-color: var(--accent);
+  }
+  100% {
+    outline-color: transparent;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Dialogues natifs                                                    */
 /* ------------------------------------------------------------------ */
@@ -569,5 +587,10 @@ dialog::backdrop {
     animation: none;
     border-right-color: currentColor;
     opacity: 0.6;
+  }
+
+  /* Mise en évidence fixe (sans fondu), retirée au bout de quelques secondes */
+  .flash-target {
+    animation: none;
   }
 }

@@ -5,6 +5,7 @@
     formatMonth,
     hasSynthesisContent,
     hrefDay,
+    linksOfKind,
     moodEmoji,
     moodWord,
     plural,
@@ -13,13 +14,19 @@
   } from './helpers';
   import MoodStrip from './MoodStrip.svelte';
 
-  // Journal : courbe d'humeur + liste des jours (récent → ancien), groupés par mois.
+  // Journal : choses prévues à venir, courbe d'humeur, liste des jours (récent → ancien), groupés
+  // par mois. Un jour qui n'a que des notes d'autres jours (« Ajouté plus tard », « Prévu »)
+  // apparaît aussi.
   const app = useApp();
 
   const PAGE = 60;
   let shown = $state(PAGE);
 
-  const groups = $derived(app.days.filter((g) => g.entries.length > 0 || g.synthesis));
+  const groups = $derived(
+    app.days.filter(
+      (g) => g.day <= app.today && (g.entries.length > 0 || !!g.synthesis || (g.links?.length ?? 0) > 0),
+    ),
+  );
   const months = $derived.by(() => {
     const out: { key: string; label: string; days: DayGroup[] }[] = [];
     for (const g of groups.slice(0, shown)) {
@@ -33,11 +40,30 @@
 
   function fallbackLine(g: DayGroup): string {
     const titles = g.entries.flatMap((e) => (e.analysis?.title ? [e.analysis.title] : []));
-    return titles.join(' · ');
+    if (titles.length > 0) return titles.join(' · ');
+    // Jour sans entrée : ce qui y a été rattaché depuis d'autres jours.
+    return (g.links ?? []).map((l) => l.mention.text).join(' · ');
+  }
+
+  /** « 1 ajout · 1 chose prévue » : notes d'autres jours rattachées à ce jour (même mot que « À venir »). */
+  function linksLine(g: DayGroup): string {
+    const added = linksOfKind(g.links, 'past').length;
+    const planned = linksOfKind(g.links, 'future').length;
+    return [
+      added > 0 ? plural(added, 'ajout', 'ajouts') : '',
+      planned > 0 ? plural(planned, 'chose prévue', 'choses prévues') : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
   }
 
   function statusLine(g: DayGroup): string {
-    const n = plural(g.entries.length, 'entrée', 'entrées');
+    const links = linksLine(g);
+    if (g.entries.length === 0) {
+      if (g.day === app.today) return links ? `${links} — pas encore d'entrée` : "pas encore d'entrée";
+      return links ? `${links} — aucune entrée ce jour-là` : 'aucune entrée';
+    }
+    const n = [plural(g.entries.length, 'entrée', 'entrées'), links].filter(Boolean).join(' · ');
     if (g.synthesis) return n;
     // Seulement des enregistrements inaudibles : pas de synthèse à attendre
     if (!hasSynthesisContent(g.entries)) return n;
@@ -45,12 +71,39 @@
     if (g.entries.some((e) => e.local.needsAnalysis)) return `${n} — analyse en attente`;
     return `${n} — synthèse à la prochaine synchro`;
   }
+
+  /** Choses prévues d'un jour à venir, en une ligne. */
+  function plannedLine(g: DayGroup): string {
+    return linksOfKind(g.links, 'future')
+      .map((l) => l.mention.text)
+      .join(' · ');
+  }
 </script>
 
 <section class="screen journal" aria-labelledby="journal-title">
   <header class="screen-header">
     <h1 id="journal-title">Journal</h1>
   </header>
+
+  {#if app.upcomingDays.length > 0}
+    <section class="month upcoming" aria-labelledby="upcoming-title">
+      <h2 id="upcoming-title" class="month-title"><span aria-hidden="true">📌</span>{' '}À venir</h2>
+      <ol class="days">
+        {#each app.upcomingDays as g (g.day)}
+          {@const n = linksOfKind(g.links, 'future').length}
+          <li>
+            <a class="day card planned" href={hrefDay(g.day)}>
+              <span class="day-head">
+                <span class="date">{relativeDayLabel(g.day, app.today)}</span>
+              </span>
+              <span class="summary">{plannedLine(g)}</span>
+              <span class="status">{plural(n, 'chose prévue', 'choses prévues')}</span>
+            </a>
+          </li>
+        {/each}
+      </ol>
+    </section>
+  {/if}
 
   <MoodStrip />
 
@@ -145,6 +198,10 @@
 
   .day:hover {
     border-color: var(--line-strong);
+  }
+
+  .day.planned {
+    border-left: 3px solid var(--accent);
   }
 
   .day-head {

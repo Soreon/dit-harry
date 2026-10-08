@@ -1,5 +1,6 @@
 <script lang="ts">
   import { useApp } from '../lib/app.svelte';
+  import DayLinks from './DayLinks.svelte';
   import EntryCard from './EntryCard.svelte';
   import { formatDayHeading, hrefDay, plural } from './helpers';
   import InstallCard from './InstallCard.svelte';
@@ -27,6 +28,13 @@
     <p class="kicker">{greeting}</p>
     <h1 id="today-title" tabindex="-1" bind:this={title}>{formatDayHeading(app.today, app.today)}</h1>
   </header>
+
+  {#if app.ready && app.todayPlanned.length > 0}
+    <!-- Ce qui avait été annoncé pour aujourd'hui dans des entrées précédentes -->
+    <div class="planned">
+      <DayLinks links={app.todayPlanned} kind="future" title="Prévu aujourd'hui" flush />
+    </div>
+  {/if}
 
   {#if !app.ready}
     <p class="muted loading"><span class="spinner" aria-hidden="true"></span> Chargement de ton journal…</p>
@@ -76,6 +84,10 @@
 
   .head h1 {
     font-size: 2rem;
+  }
+
+  .planned {
+    margin-bottom: 20px;
   }
 
   .loading {

@@ -1,23 +1,29 @@
 <script lang="ts">
   import { useApp } from '../lib/app.svelte';
+  import { activeMentions, pendingProposals } from '../lib/mentions';
   import type { LocalEntry } from '../lib/types';
   import {
     entrySnippet,
     entryStatus,
     entryTitle,
+    formatDayShort,
     formatDuration,
     formatTime,
     hrefEntry,
     moodEmoji,
+    plural,
   } from './helpers';
   import Icon from './Icon.svelte';
 
-  // Carte d'une entrée : heure, source, humeur, titre, résumé, statut (+ Réessayer).
+  // Carte d'une entrée : heure, source, humeur, titre, résumé, rattachements à d'autres jours,
+  // statut (+ Réessayer).
   let { entry, lines = 2 }: { entry: LocalEntry; lines?: 1 | 2 | 3 } = $props();
   const app = useApp();
 
   const status = $derived(entryStatus(entry, app.syncStatus));
   const snippet = $derived(entrySnippet(entry));
+  const linked = $derived(app.dayLinksOn ? activeMentions(entry) : []);
+  const toChoose = $derived(app.dayLinksOn ? pendingProposals(entry).length : 0);
   let retrying = $state(false);
 
   async function retry(): Promise<void> {
@@ -52,6 +58,22 @@
 
   {#if snippet}
     <p class="snippet" style:-webkit-line-clamp={lines} style:line-clamp={lines}>{snippet}</p>
+  {/if}
+
+  {#if linked.length > 0 || toChoose > 0}
+    <p class="links">
+      {#each linked.slice(0, 2) as m (m.id)}
+        <span class="chip" class:chip-future={m.kind === 'future'}>
+          <span aria-hidden="true">{m.kind === 'past' ? '↪' : '📌'}</span>
+          <span class="sr-only">{m.kind === 'past' ? 'Ajouté au' : 'Prévu le'}</span>
+          {formatDayShort(m.day)}
+        </span>
+      {/each}
+      {#if linked.length > 2}<span class="chip">+{linked.length - 2}</span>{/if}
+      {#if toChoose > 0}
+        <span class="chip chip-pending">{plural(toChoose, 'jour à choisir', 'jours à choisir')}</span>
+      {/if}
+    </p>
   {/if}
 
   {#if status.kind !== 'ok'}
@@ -145,6 +167,17 @@
     display: -webkit-box;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+
+  .links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .chip-future {
+    background: var(--accent-soft);
+    color: var(--accent-strong);
   }
 
   .status {

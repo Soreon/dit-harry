@@ -215,3 +215,38 @@ describe('downloadBlob', () => {
     expect(revoke).toHaveBeenCalledWith('blob:fake');
   });
 });
+
+describe('buildExportZip — notes d’autres jours', () => {
+  function withMentions(e: LocalEntry): LocalEntry {
+    return {
+      ...e,
+      analysis: e.analysis && {
+        ...e.analysis,
+        mentions: [
+          { id: 'p1', kind: 'past', day: '2026-10-03', when: 'samedi dernier', text: 'Mer.', status: 'auto' },
+          { id: 'f1', kind: 'future', day: '2026-10-12', when: 'lundi prochain', text: 'Dentiste.', status: 'auto' },
+        ],
+      },
+    };
+  }
+
+  it('un jour qui n’a que des notes a sa page ; jamais un jour à venir', async () => {
+    const db = freshDb();
+    await db.putEntry(withMentions(makeEntry('src', '2026-10-08', 9, 0)));
+    const files = await unzip((await buildExportZip(db, NOW)).blob);
+    expect(files.get('markdown/2026/2026-10-03.md')).toContain("## Ajouté plus tard\n\n- Mer. *(dit le jeudi 8 octobre 2026 à 09:00, « samedi dernier »)*");
+    expect(files.has('markdown/2026/2026-10-12.md')).toBe(false);
+    expect(files.get('markdown/2026/2026-10-08.md')).toContain('📌 Prévu pour le lundi 12 octobre 2026 (« lundi prochain »).');
+    // Le JSON garde tout, y compris les mentions
+    expect(files.get('dit-harry.json')).toContain('"mentions"');
+  });
+
+  it('« Rattacher aux autres jours » désactivé : pas de page ni de ligne pour les notes', async () => {
+    const db = freshDb();
+    await db.setKv('settings', { dayLinks: 'off' });
+    await db.putEntry(withMentions(makeEntry('src', '2026-10-08', 9, 0)));
+    const files = await unzip((await buildExportZip(db, NOW)).blob);
+    expect(files.has('markdown/2026/2026-10-03.md')).toBe(false);
+    expect(files.get('markdown/2026/2026-10-08.md')).not.toContain('Prévu pour');
+  });
+});

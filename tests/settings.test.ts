@@ -26,8 +26,27 @@ describe('DEFAULT_SETTINGS', () => {
       synthesisModel: config.defaultSynthesisModel,
       mirrorEnabled: true,
       audioRetentionDays: config.defaultAudioRetentionDays,
+      dayLinks: 'auto',
       updatedAt: '1970-01-01T00:00:00.000Z',
     });
+  });
+});
+
+describe('dayLinks (« Rattacher aux autres jours »)', () => {
+  it('automatique par défaut, « off » seulement si demandé explicitement', () => {
+    expect(normalizeSettings({}).dayLinks).toBe('auto');
+    expect(normalizeSettings({ dayLinks: 'off' }).dayLinks).toBe('off');
+    expect(normalizeSettings({ dayLinks: 'ask' }).dayLinks).toBe('auto');
+    expect(normalizeSettings({ dayLinks: false }).dayLinks).toBe('auto');
+  });
+
+  it('voyage avec les réglages (fusion « dernier qui écrit gagne »)', async () => {
+    const db = freshDb();
+    const saved = await saveSettings(db, { dayLinks: 'off' });
+    expect(saved.dayLinks).toBe('off');
+    expect((await loadSettings(db)).dayLinks).toBe('off');
+    const remote = settings({ dayLinks: 'auto', updatedAt: '2999-01-01T00:00:00.000Z' });
+    expect(mergeSettings(saved, remote).dayLinks).toBe('auto');
   });
 });
 

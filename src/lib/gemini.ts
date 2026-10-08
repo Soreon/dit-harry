@@ -1,10 +1,9 @@
 import { config } from '../config';
 import { AppError, toAppError } from './errors';
 import {
-  ENTRY_AUDIO_SCHEMA,
-  ENTRY_TEXT_SCHEMA,
   SYNTHESIS_SCHEMA,
   SYSTEM_INSTRUCTION,
+  audioSchemaFor,
   buildAudioRequestText,
   buildSynthesisRequestText,
   buildTextRequestText,
@@ -13,6 +12,9 @@ import {
   normalizeAnalysis,
   normalizeSynthesis,
   normalizeTranscript,
+  synthesisRefMap,
+  synthesisSchemaFor,
+  textSchemaFor,
 } from './prompts';
 import type { JsonSchema } from './prompts';
 import type { AiClient, EntryAnalysis } from './types';
@@ -480,25 +482,34 @@ export function createGeminiClient(opts: {
           { inlineData: { mimeType: geminiAudioMime(mimeType || audio.type), data } },
           { text: buildAudioRequestText(ctx) },
         ],
-        ENTRY_AUDIO_SCHEMA,
+        audioSchemaFor(ctx),
       );
       if (typeof out['transcript'] !== 'string') throw badResponse(MSG.noTranscript, out);
       const transcript = normalizeTranscript(out['transcript']);
       if (isInaudibleTranscript(transcript)) return { transcript: '', analysis: inaudibleAnalysis() };
-      return { transcript, analysis: normalizeAnalysis(out) };
+      // Mentions d'autres jours : ancrées dans la transcription renvoyée.
+      return { transcript, analysis: normalizeAnalysis(out, ctx, transcript) };
     },
 
     async analyzeText(text, ctx) {
       if (!text.trim()) return emptyTextAnalysis();
-      const out = await generate([{ text: buildTextRequestText(text, ctx) }], ENTRY_TEXT_SCHEMA);
-      return normalizeAnalysis(out);
+      const out = await generate([{ text: buildTextRequestText(text, ctx) }], textSchemaFor(ctx));
+      return normalizeAnalysis(out, ctx, text);
     },
 
-    async synthesizeDay(day, entries) {
+    async synthesizeDay(day, entries, links) {
       const usable = entries.filter((e) => typeof e.transcript === 'string' && e.transcript.trim() !== '');
       if (usable.length === 0) throw new AppError('other', MSG.noEntries, { retryable: false });
-      const out = await generate([{ text: buildSynthesisRequestText(day, usable) }], SYNTHESIS_SCHEMA);
-      return normalizeSynthesis(out);
+      if (!links || links.length === 0) {
+        // Sans note d'un autre jour : requête identique à celle d'avant la fonctionnalité.
+        const out = await generate([{ text: buildSynthesisRequestText(day, usable) }], SYNTHESIS_SCHEMA);
+        return normalizeSynthesis(out);
+      }
+      const out = await generate(
+        [{ text: buildSynthesisRequestText(day, usable, links) }],
+        synthesisSchemaFor(links),
+      );
+      return normalizeSynthesis(out, synthesisRefMap(links));
     },
 
     async checkKey() {

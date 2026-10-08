@@ -1,6 +1,8 @@
-import type { AiClient, DaySynthesis, Entry, EntryAnalysis, EntryContext, Mood } from '../types';
+import type { AiClient, DayLink, DayMention, Entry, EntryAnalysis, EntryContext, MentionVerdict, Mood, SynthesisResult } from '../types';
 import { AppError } from '../errors';
+import { contentWords, resolveMentions, synthesisRefs } from '../mentions';
 import { formatDayFr, formatDuration, sleep, stripMimeParams } from '../util';
+import { WEEKDAYS, nextWeekday, previousWeekday } from '../when';
 
 /* ------------------------------------------------------------------ */
 /* Analyse déterministe d'un texte (heuristiques françaises simples)   */
@@ -243,13 +245,70 @@ function detectTodos(text: string): string[] {
   return dedupe(todos);
 }
 
+/* ------------------------------------------------------------------ */
+/* Mentions d'autres jours (démo) : expressions simples                */
+/* ------------------------------------------------------------------ */
+
+const NUMBER = '(?:\\d{1,2}|une?|deux|trois|quatre|cinq|six|sept|huit|neuf|dix|onze|douze|treize|quatorze|quinze|seize|vingt)';
+const WEEKDAY = `(?:${WEEKDAYS.join('|')})`;
+const MOMENT = '(?: (?:matin|midi|après-midi|soir))?';
+/** Début et fin de mot (les accents comptent comme des lettres). */
+const START = '(?<![\\p{L}\\p{N}-])';
+const END = '(?![\\p{L}\\p{N}])';
+/** Repères reconnus par la démo, du plus long au plus court. */
+const MENTION_RE = new RegExp(
+  `${START}(?:avant-hier${MOMENT}|apr[eè]s-demain${MOMENT}|hier${MOMENT}|demain${MOMENT}|il y a ${NUMBER} (?:jours?|semaines?)|dans ${NUMBER} (?:jours?|semaines?)|(?:le |ce )?week-?end (?:dernier|prochain)|${WEEKDAY}${MOMENT}(?: (?:dernier|prochain))?)${END}`,
+  'iu',
+);
+const FUTURE_HINT_RE = /(?:je vais|j['’]irai|on va|nous allons|je serai|je dois|rendez-vous|prévu|\p{L}+rai)(?![\p{L}])/iu;
+const PAST_HINT_RE = /(?:j['’]ai|on a|nous avons|je suis allée?|on est allée?s?|c['’]était|j['’]étais)(?![\p{L}])/iu;
+
+function sentencesOf(text: string): string[] {
+  return text
+    .split(/(?<=[.!?…])\s+|\n+/u)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * « Avant-hier j'ai dîné avec Paul. » → { when: 'Avant-hier', date: '', text: "J'ai dîné avec Paul." }.
+ * Un jour de la semaine seul (« Lundi j'ai vu Paul ») reçoit une date selon le temps du verbe,
+ * comme le ferait le modèle ; tout passe ensuite par la même validation que les vraies réponses.
+ */
+export function mockDetectMentions(text: string, ctx: EntryContext): DayMention[] {
+  if (ctx.dayLinks !== 'auto') return [];
+  const raw: { when: string; date: string; text: string }[] = [];
+  for (const sentence of sentencesOf(text)) {
+    const m = MENTION_RE.exec(sentence);
+    if (!m) continue;
+    // « avant vendredi », « d'ici demain » : une échéance, pas un fait de ce jour-là.
+    if (/(?:avant|après|d['’]ici|jusqu['’]à|depuis)\s*$/iu.test(sentence.slice(0, m.index))) continue;
+    const when = m[0];
+    const rest = `${sentence.slice(0, m.index)} ${sentence.slice(m.index + when.length)}`
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s,;:–—-]+/u, '')
+      .trim();
+    if (!/\p{L}/u.test(rest)) continue;
+    const fact = capitalize(/[.!?…]$/u.test(rest) ? rest : `${rest}.`);
+    let date = '';
+    const bareWeekday = new RegExp(`^${WEEKDAY}${MOMENT}$`, 'iu').test(when);
+    if (bareWeekday) {
+      const wd = WEEKDAYS.findIndex((d) => fold(when).startsWith(d));
+      if (wd >= 0 && FUTURE_HINT_RE.test(rest)) date = nextWeekday(ctx.day, wd);
+      else if (wd >= 0 && PAST_HINT_RE.test(rest)) date = previousWeekday(ctx.day, wd);
+    }
+    raw.push({ when, date, text: fact });
+  }
+  return resolveMentions(raw, ctx, text);
+}
+
 /** Analyse déterministe dérivée du texte (même texte → même résultat). */
-export function mockAnalyzeText(text: string): EntryAnalysis {
+export function mockAnalyzeText(text: string, ctx?: EntryContext): EntryAnalysis {
   const clean = text.trim();
   const tokens = tokenize(clean);
   const { people, places } = detectNames(clean, tokens);
   const exclude = new Set([...people, ...places].map(fold));
-  return {
+  const analysis: EntryAnalysis = {
     title: makeTitle(clean),
     summary: truncate(firstSentence(clean), 240),
     mood: detectMood(tokens),
@@ -258,6 +317,9 @@ export function mockAnalyzeText(text: string): EntryAnalysis {
     places,
     todos: detectTodos(clean),
   };
+  const mentions = ctx ? mockDetectMentions(clean, ctx) : [];
+  if (mentions.length > 0) analysis.mentions = mentions;
+  return analysis;
 }
 
 /* ------------------------------------------------------------------ */
@@ -307,10 +369,39 @@ export async function mockTranscribe(
 /* Synthèse du jour                                                    */
 /* ------------------------------------------------------------------ */
 
-type SynthesisResult = Pick<DaySynthesis, 'summary' | 'mood' | 'highlights' | 'themes' | 'todos'>;
+/**
+ * Verdict de démo sur un fait raconté plus tard : part de ses mots pleins déjà présents dans les
+ * entrées du jour (≥ 80 % : déjà raconté ; ≥ 40 % : le complète ; sinon nouveau).
+ */
+function mockVerdict(text: string, entries: Entry[]): MentionVerdict {
+  const words = contentWords(text);
+  if (words.size === 0) return 'nouveau';
+  const day = contentWords(entries.map((e) => e.transcript).join(' '));
+  let found = 0;
+  for (const w of words) if (day.has(w)) found++;
+  const ratio = found / words.size;
+  return ratio >= 0.8 ? 'deja' : ratio >= 0.4 ? 'complete' : 'nouveau';
+}
 
-/** Synthèse déterministe à partir des analyses des entrées. */
-export function mockSynthesizeDay(entries: Entry[]): SynthesisResult {
+/** Synthèse déterministe à partir des analyses des entrées (et des notes d'autres jours). */
+export function mockSynthesizeDay(entries: Entry[], links?: DayLink[]): SynthesisResult {
+  const base = mockSynthesizeEntries(entries);
+  if (!links || links.length === 0) return base;
+  const { past, future } = synthesisRefs(links);
+  const verdicts: Record<string, MentionVerdict> = {};
+  const extra: string[] = [];
+  for (const { link } of past) {
+    const verdict = mockVerdict(link.mention.text, entries);
+    verdicts[link.ref] = verdict;
+    if (verdict !== 'deja') extra.push(`Raconté plus tard : ${link.mention.text}`);
+  }
+  // Prévu : jamais présenté comme arrivé.
+  for (const { link } of future) extra.push(`C'était prévu : ${link.mention.text}`);
+  const summary = [base.summary, ...extra.map((s) => (/[.!?…]$/u.test(s) ? s : `${s}.`))].join(' ');
+  return past.length > 0 ? { ...base, summary, mentionVerdicts: verdicts } : { ...base, summary };
+}
+
+function mockSynthesizeEntries(entries: Entry[]): SynthesisResult {
   const analyzed = entries
     .filter((e): e is Entry & { analysis: EntryAnalysis } => !!e.analysis)
     .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
@@ -395,17 +486,17 @@ export function createMockAiClient(opts: { latencyMs?: number } = {}): AiClient 
         };
       }
       // L'analyse porte sur le texte d'exemple (la note technique est ignorée).
-      return { transcript, analysis: mockAnalyzeText(body) };
+      return { transcript, analysis: mockAnalyzeText(body, ctx) };
     },
 
-    async analyzeText(text) {
+    async analyzeText(text, ctx) {
       await call();
-      return mockAnalyzeText(text);
+      return mockAnalyzeText(text, ctx);
     },
 
-    async synthesizeDay(_day, entries) {
+    async synthesizeDay(_day, entries, links) {
       await call();
-      return mockSynthesizeDay(entries);
+      return mockSynthesizeDay(entries, links);
     },
 
     async checkKey() {

@@ -1,5 +1,6 @@
-import type { DayKey, DaySynthesis, Entry, Mood } from './types';
-import { formatDayFrTitle, formatDuration, timeHHmm } from './util';
+import { activeMentions } from './mentions';
+import type { DayKey, DayLink, DaySynthesis, Entry, Mood } from './types';
+import { formatDayFr, formatDayFrTitle, formatDuration, timeHHmm } from './util';
 
 /**
  * Rendu Markdown (français) d'une journée : synthèse + entrées.
@@ -77,7 +78,55 @@ function byCreatedAsc(a: Entry, b: Entry): number {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
-function entryBlocks(entry: Entry): string[] {
+/** « 08:15 » d'une date ISO, ou '' si illisible. */
+function timeOf(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : timeHHmm(d);
+}
+
+/** « le samedi 10 octobre 2026 à 08:15 » */
+function saidOn(link: DayLink): string {
+  const t = timeOf(link.sourceCreatedAt);
+  return `le ${formatDayFr(link.sourceDay)}${t ? ` à ${t}` : ''}`;
+}
+
+/** « « avant-hier » » (repère cité), ou '' */
+function quoted(when: string): string {
+  const w = inline(when);
+  return w ? `« ${w} »` : '';
+}
+
+/** Lignes « ↪ Noté aussi au … » / « 📌 Prévu pour le … » sous l'entrée qui contient les mentions. */
+function mentionLines(entry: Entry): string[] {
+  return activeMentions(entry).map((m) => {
+    const q = quoted(m.when);
+    const said = q ? ` (${q})` : '';
+    return m.kind === 'past'
+      ? `↪ Noté aussi au ${formatDayFr(m.day)}${said}.`
+      : `📌 Prévu pour le ${formatDayFr(m.day)}${said}.`;
+  });
+}
+
+/** Section « Prévu » (choses annoncées pour ce jour) ou « Ajouté plus tard » (faits racontés après). */
+function linkBlocks(links: readonly DayLink[], kind: 'past' | 'future', synthesis?: DaySynthesis): string[] {
+  const list = links.filter((l) => l.mention.kind === kind);
+  if (list.length === 0) return [];
+  const items = list.map((l) => {
+    const text = inline(l.mention.text);
+    const q = quoted(l.mention.when);
+    const verdict = synthesis?.mentionVerdicts?.[l.ref];
+    if (verdict === 'deja' || l.repeatOf) {
+      // Déjà raconté ce jour-là (verdict de la synthèse) ou par une entrée précédente : renvoi.
+      const head = verdict === 'deja' ? 'Tu y es revenu' : kind === 'past' ? 'Raconté aussi' : 'Annoncé aussi';
+      return `- ↩ ${head} ${saidOn(l)}${q ? ` (${q})` : ''} : ${text}`;
+    }
+    const extra = verdict === 'complete' ? ' — complète ce jour-là' : '';
+    return `- ${safeLineStart(text)} *(${kind === 'past' ? 'dit' : 'annoncé'} ${saidOn(l)}${q ? `, ${q}` : ''}${extra})*`;
+  });
+  return [kind === 'past' ? '## Ajouté plus tard' : '## Prévu', items.join('\n')];
+}
+
+function entryBlocks(entry: Entry, withMentions: boolean): string[] {
   const blocks: string[] = [];
   const a = entry.analysis;
   const created = new Date(entry.createdAt);
@@ -112,6 +161,10 @@ function entryBlocks(entry: Entry): string[] {
 
   const todos = a ? bulletList(a.todos) : null;
   if (todos) blocks.push('**À faire**', todos);
+  if (withMentions) {
+    const lines = mentionLines(entry);
+    if (lines.length) blocks.push(lines.join('  \n'));
+  }
   return blocks;
 }
 
@@ -131,8 +184,18 @@ function synthesisBlocks(s: DaySynthesis): string[] {
   return blocks;
 }
 
-/** Markdown d'une journée. Se termine par un unique saut de ligne. */
-export function renderDayMarkdown(day: DayKey, entries: Entry[], synthesis?: DaySynthesis): string {
+/**
+ * Markdown d'une journée. Se termine par un unique saut de ligne.
+ * `links` (notes d'autres jours qui visent ce jour) : fourni quand « Rattacher aux autres jours »
+ * est actif ; ajoute « Prévu », « Ajouté plus tard » et, sous chaque entrée, les jours auxquels
+ * elle a été rattachée. Sans note ni mention, le texte est identique à celui d'avant.
+ */
+export function renderDayMarkdown(
+  day: DayKey,
+  entries: Entry[],
+  synthesis?: DaySynthesis,
+  links?: readonly DayLink[],
+): string {
   const blocks: string[] = [`# ${formatDayFrTitle(day)}`];
 
   if (synthesis) {
@@ -140,13 +203,17 @@ export function renderDayMarkdown(day: DayKey, entries: Entry[], synthesis?: Day
     blocks.push(...synthesisBlocks(synthesis));
   }
 
+  if (links) blocks.push(...linkBlocks(links, 'future', synthesis));
+
   blocks.push('## Entrées');
   const sorted = [...entries].sort(byCreatedAsc);
   if (sorted.length === 0) {
     blocks.push('*Aucune entrée.*');
   } else {
-    for (const entry of sorted) blocks.push(...entryBlocks(entry));
+    for (const entry of sorted) blocks.push(...entryBlocks(entry, !!links));
   }
+
+  if (links) blocks.push(...linkBlocks(links, 'past', synthesis));
 
   return `${blocks.join('\n\n')}\n`;
 }

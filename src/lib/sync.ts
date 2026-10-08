@@ -8,12 +8,22 @@ import { config } from '../config';
 import { updateEntry, updateKv, withEntryLock, withKvLock } from './db';
 import { AppError, isAppError, toAppError } from './errors';
 import { renderDayMarkdown } from './markdown';
+import {
+  collectDayLinks,
+  isKnownSignatureSuffix,
+  linksSignature,
+  mergeAnalysisMentions,
+  mergeMentionChoices,
+  settledLinks,
+  splitSignature,
+} from './mentions';
 import { loadSettings, mergeSettings, normalizeSettings } from './settings';
 import type {
   AccountConflict,
   AiClient,
   AuthService,
   DayKey,
+  DayLink,
   DaySynthesis,
   DriveClient,
   DriveFileMeta,
@@ -24,6 +34,7 @@ import type {
   LocalDb,
   LocalEntry,
   LocalSynthesis,
+  MentionVerdict,
   Mood,
   Settings,
   SyncEngine,
@@ -335,13 +346,25 @@ function parseRemoteEntry(raw: unknown, entryId: string): Entry | null {
   return e;
 }
 
+const VERDICTS = new Set<string>(['nouveau', 'complete', 'deja']);
+
+/** Verdicts de synthèse valides (les autres valeurs sont ignorées). */
+function parseVerdicts(v: unknown): Record<string, MentionVerdict> | undefined {
+  if (!isRecord(v)) return undefined;
+  const out: Record<string, MentionVerdict> = {};
+  for (const [ref, verdict] of Object.entries(v)) {
+    if (typeof verdict === 'string' && VERDICTS.has(verdict)) out[ref] = verdict as MentionVerdict;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Valide le JSON d'une synthèse téléchargée depuis Drive. */
 function parseRemoteSynthesis(raw: unknown, day: DayKey): DaySynthesis | null {
   if (!isRecord(raw)) return null;
   if (raw.day !== day || typeof raw.generatedAt !== 'string' || typeof raw.summary !== 'string') {
     return null;
   }
-  return {
+  const s: DaySynthesis = {
     day,
     generatedAt: raw.generatedAt,
     model: typeof raw.model === 'string' ? raw.model : '',
@@ -352,6 +375,15 @@ function parseRemoteSynthesis(raw: unknown, day: DayKey): DaySynthesis | null {
     themes: stringList(raw.themes),
     todos: stringList(raw.todos),
   };
+  // Reconstruit champ par champ : sans cette ligne, les verdicts se perdraient à chaque pull.
+  const verdicts = parseVerdicts(raw.mentionVerdicts);
+  if (verdicts) s.mentionVerdicts = verdicts;
+  return s;
+}
+
+/** Notes d'autres jours, par jour visé (vide si « Rattacher aux autres jours » est désactivé). */
+function linksByDayOf(entries: readonly LocalEntry[], settings: Settings): Map<DayKey, DayLink[]> {
+  return settings.dayLinks === 'off' ? new Map() : collectDayLinks(entries);
 }
 
 /**
@@ -367,6 +399,20 @@ function mergeTechnical(winner: Entry, other: Entry): Entry {
     out.audioFileId = other.audioFileId;
   }
   return out;
+}
+
+/**
+ * Mentions d'autres jours : la liste de la version retenue (`merged`), plus les choix de
+ * l'utilisateur faits sur l'une ou l'autre version (ceux de `mine`, cet appareil, l'emportent).
+ */
+function withMentionChoices(merged: Entry, mine: Entry, theirs: Entry): Entry {
+  if (!merged.analysis) return merged;
+  const list = mergeMentionChoices(merged.analysis.mentions, mine.analysis?.mentions, theirs.analysis?.mentions);
+  if (!list) return merged;
+  const analysis: EntryAnalysis = { ...merged.analysis };
+  if (list.length > 0) analysis.mentions = list;
+  else delete analysis.mentions;
+  return { ...merged, analysis };
 }
 
 /** Range les fichiers de l'appDataFolder par type (appProperties, sinon nom du fichier). */
@@ -682,7 +728,12 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
     snap: LocalEntry,
     ctx: Ctx,
   ): Promise<{ transcript?: string; analysis: EntryAnalysis } | null> {
-    const ectx: EntryContext = { day: snap.day, time: timeHHmm(new Date(snap.createdAt)) };
+    const ectx: EntryContext = {
+      day: snap.day,
+      time: timeHHmm(new Date(snap.createdAt)),
+      // Désactivé : ni consigne, ni repères, ni champ `mentions` dans la requête.
+      dayLinks: ctx.settings.dayLinks === 'off' ? 'off' : 'auto',
+    };
     if (snap.source === 'voice' && !snap.transcriptEdited) {
       let blob = await db.getAudio(snap.id);
       if (!blob) {
@@ -759,7 +810,9 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
           delete local.retryAfter;
           const next: LocalEntry = {
             ...cur,
-            analysis: result.analysis,
+            // Les choix faits sur les mentions d'autres jours (confirmer, déplacer, retirer)
+            // survivent à la nouvelle analyse ; détection désactivée → mentions gardées telles quelles.
+            analysis: mergeAnalysisMentions(cur.analysis, result.analysis, ctx.settings.dayLinks !== 'off'),
             analysisModel: ctx.settings.entryModel,
             analyzedAt: at,
             updatedAt: at,
@@ -916,7 +969,11 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
   function mergeEntry(cur: LocalEntry, remote: Entry, meta: DriveFileMeta): LocalEntry {
     const remoteWins = !cur.local.dirty || timeOf(remote.updatedAt) > timeOf(cur.updatedAt);
     if (remoteWins) {
-      const merged = mergeTechnical(remote, toRemoteEntry(cur));
+      const local0 = toRemoteEntry(cur);
+      let merged = mergeTechnical(remote, local0);
+      // Geste fait ici (pas encore envoyé) sur une mention : la version distante plus récente ne
+      // l'efface pas (les gestes ne touchent pas `updatedAt`). Il sera renvoyé (dirty ci-dessous).
+      if (cur.local.dirty) merged = withMentionChoices(merged, local0, remote);
       const local = {
         ...cur.local, // garde notamment hasLocalAudio
         driveFileId: meta.id,
@@ -933,8 +990,10 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
       }
       return { ...merged, local };
     }
-    // La locale gagne (plus récente, ou égalité) : elle sera renvoyée.
-    const merged = mergeTechnical(toRemoteEntry(cur), remote);
+    // La locale gagne (plus récente, ou égalité) : elle sera renvoyée, avec les gestes faits sur
+    // l'autre appareil (mentions) que la version locale ne connaît pas.
+    const local0 = toRemoteEntry(cur);
+    const merged = withMentionChoices(mergeTechnical(local0, remote), local0, remote);
     return {
       ...merged,
       local: { ...cur.local, driveFileId: meta.id, remoteModifiedTime: meta.modifiedTime, dirty: true },
@@ -1219,7 +1278,15 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
         analyzed: LocalEntry[];
         sig: string;
         forced: boolean;
+        /** Notes d'autres jours, dites avant aujourd'hui, qui visent ce jour (faits racontés plus tard, choses prévues). */
+        links: DayLink[];
+        /** Seules les notes d'autres jours ont changé depuis la synthèse existante. */
+        linksOnly: boolean;
       };
+      const linksOn = ctx.settings.dayLinks !== 'off';
+      const linksByDay = linksByDayOf(entries, ctx.settings);
+      // Entrées dont l'analyse va être refaite : leurs mentions peuvent encore changer.
+      const pendingSources = new Set(entries.filter(isRetryablePending).map((e) => e.id));
       const candidates: Candidate[] = [];
       for (const [day, list] of byDay) {
         const isForced = forced.has(day);
@@ -1231,19 +1298,39 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
           continue;
         }
         if (list.some(isRetryablePending)) continue;
-        const sig = entriesSignature(analyzed);
+        const base = entriesSignature(analyzed);
+        // Notes dites avant aujourd'hui seulement : celles d'aujourd'hui sont intégrées une fois,
+        // demain, toutes ensemble (jamais de régénération le jour même où elles sont dites).
+        const links = settledLinks(linksByDay.get(day) ?? [], today);
+        // Sans note d'un autre jour : exactement la signature d'avant (aucune régénération).
+        const sig = linksSignature(base, links);
         const existing = synthByDay.get(day);
+        let linksOnly = false;
         if (!isForced) {
           if (existing && existing.basedOn === sig) continue;
+          // Une entrée source d'une note attend une nouvelle analyse : jour gelé jusque-là (ses
+          // mentions peuvent encore changer).
+          if (links.some((l) => pendingSources.has(l.entryId))) continue;
+          if (existing) {
+            const prev = splitSignature(existing.basedOn);
+            // Signature d'une version plus récente de l'appli : pas de régénération automatique.
+            if (!isKnownSignatureSuffix(prev.suffix)) continue;
+            linksOnly = prev.base === base;
+            // Désactivé : jamais de régénération pour des notes d'autres jours.
+            if (linksOnly && !linksOn) continue;
+          }
           const f = failures[day];
           if (f && f.sig === sig && timeOf(f.retryAfter) > nowMs) continue;
         }
-        candidates.push({ day, analyzed, sig, forced: isForced });
+        candidates.push({ day, analyzed, sig, forced: isForced, links, linksOnly });
       }
-      // Demandes manuelles d'abord, puis les jours les plus récents.
-      candidates.sort((a, b) =>
-        a.forced !== b.forced ? (a.forced ? -1 : 1) : a.day < b.day ? 1 : a.day > b.day ? -1 : 0,
-      );
+      // Demandes manuelles d'abord, puis les jours les plus récents ; en dernier, les jours qui ne
+      // changent que par des notes d'autres jours.
+      candidates.sort((a, b) => {
+        if (a.forced !== b.forced) return a.forced ? -1 : 1;
+        if (a.linksOnly !== b.linksOnly) return a.linksOnly ? 1 : -1;
+        return a.day < b.day ? 1 : a.day > b.day ? -1 : 0;
+      });
       const batch = candidates.slice(0, config.maxSynthesesPerRun);
 
       if (batch.length > 0) {
@@ -1260,13 +1347,16 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
           for (const c of batch) {
             try {
               const input = c.analyzed.map(toRemoteEntry).sort(byCreatedAsc);
-              const res = await ai.synthesizeDay(c.day, input);
+              const res =
+                c.links.length > 0
+                  ? await ai.synthesizeDay(c.day, input, c.links)
+                  : await ai.synthesizeDay(c.day, input);
               rejectedKey = null;
               const prev = await db.getSynthesis(c.day);
               const local: LocalSynthesis['local'] = { dirty: true };
               if (prev?.local.driveFileId) local.driveFileId = prev.local.driveFileId;
               if (prev?.local.remoteModifiedTime) local.remoteModifiedTime = prev.local.remoteModifiedTime;
-              await db.putSynthesis({
+              const synthesis: LocalSynthesis = {
                 day: c.day,
                 generatedAt: now().toISOString(),
                 model: ctx.settings.synthesisModel,
@@ -1277,7 +1367,10 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
                 themes: res.themes,
                 todos: res.todos,
                 local,
-              });
+              };
+              const verdicts = parseVerdicts(res.mentionVerdicts);
+              if (verdicts) synthesis.mentionVerdicts = verdicts;
+              await db.putSynthesis(synthesis);
               delete failures[c.day];
               if (c.forced) doneForced.add(c.day);
               ctx.changed = true;
@@ -1420,9 +1513,16 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
 
     const state = normalizeMirrorState(await db.getKv<unknown>(KV.mirrorState));
     const save = (): Promise<void> => db.setKv(KV.mirrorState, state);
-    const byDay = groupByDay(await db.listEntries());
+    const allEntries = await db.listEntries();
+    const byDay = groupByDay(allEntries);
     const synthByDay = new Map((await db.listSyntheses()).map((s) => [s.day, s]));
-    const days = [...new Set([...byDay.keys(), ...synthByDay.keys()])].sort().reverse();
+    const linksOn = ctx.settings.dayLinks !== 'off';
+    const linksByDay = linksByDayOf(allEntries, ctx.settings);
+    // Jours qui n'ont que des notes d'autres jours : copiés aussi (sinon la règle « jour disparu »
+    // effacerait leur fichier), mais jamais avant leur date (pas de fichier pour un jour à venir).
+    const today = dayKey(now());
+    const linkDays = [...linksByDay.keys()].filter((d) => d <= today);
+    const days = [...new Set([...byDay.keys(), ...synthByDay.keys(), ...linkDays])].sort().reverse();
 
     const folderFor = async (day: DayKey): Promise<string> => {
       let rootId = state.rootId;
@@ -1448,7 +1548,12 @@ export function createSyncEngine(deps: SyncDeps): SyncEngine {
         try {
           const entries = (byDay.get(day) ?? []).map(toRemoteEntry).sort(byCreatedAsc);
           const synth = synthByDay.get(day);
-          const md = renderDayMarkdown(day, entries, synth ? toRemoteSynthesis(synth) : undefined);
+          const md = renderDayMarkdown(
+            day,
+            entries,
+            synth ? toRemoteSynthesis(synth) : undefined,
+            linksOn ? (linksByDay.get(day) ?? []) : undefined,
+          );
           const sig = fnv1a(md);
           if (state.days[day]?.sig === sig) continue;
           const parentId = await folderFor(day);

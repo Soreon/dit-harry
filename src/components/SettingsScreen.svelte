@@ -186,6 +186,29 @@
         Rétablir les modèles par défaut
       </button>
     {/if}
+
+    <label class="switch-row" for="{uid}-daylinks">
+      <span class="switch-text">
+        <span class="field-label">Rattacher aux autres jours</span>
+        <span class="field-help">
+          {#if app.dayLinksOn}
+            Automatique : quand tu parles d'un autre jour (« avant-hier », « demain », « lundi
+            dernier »…), la note apparaît aussi sur ce jour-là. Si le jour est incertain, tu le choisis
+            dans l'entrée.
+          {:else}
+            Désactivé : rien n'est cherché, et les notes déjà rattachées sont masquées (pas effacées).
+          {/if}
+        </span>
+      </span>
+      <input
+        id="{uid}-daylinks"
+        class="switch"
+        type="checkbox"
+        role="switch"
+        checked={app.dayLinksOn}
+        onchange={(e) => app.saveSettings({ dayLinks: e.currentTarget.checked ? 'auto' : 'off' })}
+      />
+    </label>
   </section>
 
   <!-- Sauvegarde -->

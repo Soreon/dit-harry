@@ -5,21 +5,27 @@ import {
   entryStatus,
   entryTitle,
   formatDayHeading,
+  formatDayLong,
+  formatDayShort,
   formatRelative,
   groupDays,
   hasSynthesisContent,
+  hrefDay,
   hrefEntry,
   lastNDays,
+  linksOfKind,
   moodEmoji,
   parseRoute,
   plural,
   relativeDayLabel,
   routeHash,
+  saidAt,
+  sameScreen,
   splitParagraphs,
   toMoodScore,
   truncate,
 } from '../src/components/helpers';
-import type { EntryAnalysis, LocalEntry, LocalSynthesis, SyncStatus } from '../src/lib/types';
+import type { DayLink, EntryAnalysis, LocalEntry, LocalSynthesis, SyncStatus } from '../src/lib/types';
 
 function entry(over: Partial<LocalEntry> & { id: string; createdAt: string }): LocalEntry {
   return {
@@ -230,3 +236,68 @@ describe('textes et dates', () => {
 function pending(): LocalEntry['local'] {
   return { dirty: true, needsAnalysis: true, hasLocalAudio: false, attempts: 0 };
 }
+
+describe('notes d’autres jours — routes, regroupement, libellés', () => {
+  it('route d’un jour avec un élément à mettre en évidence (?e=…&m=…)', () => {
+    expect(parseRoute('#/jour/2026-10-06?e=abc')).toEqual({ name: 'day', day: '2026-10-06', entry: 'abc' });
+    expect(parseRoute('#/jour/2026-10-06?e=abc&m=f00d1234')).toEqual({
+      name: 'day',
+      day: '2026-10-06',
+      entry: 'abc',
+      mention: 'f00d1234',
+    });
+    // `m` sans `e` : ignoré ; jour invalide : journal
+    expect(parseRoute('#/jour/2026-10-06?m=x')).toEqual({ name: 'day', day: '2026-10-06' });
+    expect(parseRoute('#/jour/2026-02-30?e=x')).toEqual({ name: 'journal' });
+    expect(hrefDay('2026-10-06')).toBe('#/jour/2026-10-06');
+    expect(hrefDay('2026-10-06', { entry: 'a b', mention: 'm1' })).toBe('#/jour/2026-10-06?e=a+b&m=m1');
+    for (const r of [
+      { name: 'day', day: '2026-10-06', entry: 'e1' },
+      { name: 'day', day: '2026-10-06', entry: 'a b', mention: 'm1' },
+    ] as const) {
+      expect(parseRoute(routeHash(r))).toEqual(r);
+    }
+  });
+
+  it('sameScreen ignore la mise en évidence', () => {
+    expect(sameScreen(parseRoute('#/jour/2026-10-06?e=x'), parseRoute('#/jour/2026-10-06'))).toBe(true);
+    expect(sameScreen(parseRoute('#/jour/2026-10-06'), parseRoute('#/jour/2026-10-07'))).toBe(false);
+    expect(sameScreen(parseRoute('#/entree/a'), parseRoute('#/entree/a'))).toBe(true);
+    expect(sameScreen(parseRoute('#/journal'), parseRoute('#/'))).toBe(false);
+  });
+
+  it('groupDays : notes rattachées à leur jour, jours qui n’ont que des notes (passés ou à venir)', () => {
+    const e = entry({ id: 's', createdAt: '2026-10-08T09:00:00.000Z', day: '2026-10-08' });
+    const link = (day: string, kind: 'past' | 'future'): DayLink => ({
+      entryId: 's',
+      sourceDay: '2026-10-08',
+      sourceCreatedAt: e.createdAt,
+      mention: { id: day, kind, day, when: 'x', text: 'Fait.', status: 'auto' },
+      ref: `s/${day}`,
+    });
+    const links = new Map([
+      ['2026-10-08', []],
+      ['2026-10-06', [link('2026-10-06', 'past')]],
+      ['2026-10-12', [link('2026-10-12', 'future')]],
+    ]);
+    const groups = groupDays([e], {}, links);
+    expect(groups.map((g) => g.day)).toEqual(['2026-10-12', '2026-10-08', '2026-10-06']);
+    expect(groups[0]?.entries).toEqual([]);
+    expect(groups[0]?.links?.map((l) => l.ref)).toEqual(['s/2026-10-12']);
+    expect('links' in (groups[1] ?? {})).toBe(false);
+    expect(linksOfKind(groups[2]?.links, 'past')).toHaveLength(1);
+    expect(linksOfKind(groups[2]?.links, 'future')).toEqual([]);
+    expect(linksOfKind(undefined, 'past')).toEqual([]);
+  });
+
+  it('libellés de jours', () => {
+    expect(relativeDayLabel('2026-10-09', '2026-10-08')).toBe('Demain');
+    expect(formatDayLong('2026-10-06', '2026-10-08')).toBe('mardi 6 octobre');
+    expect(formatDayLong('2025-12-31', '2026-01-02')).toBe('mercredi 31 décembre 2025');
+    expect(formatDayShort('2026-10-03')).toBe('Sam. 3 oct.');
+    const at = (d: number, h: number, m: number) => new Date(2026, 9, d, h, m).toISOString();
+    expect(saidAt('2026-10-08', at(8, 7, 42), '2026-10-08')).toBe("aujourd'hui à 07:42");
+    expect(saidAt('2026-10-07', at(7, 21, 4), '2026-10-08')).toBe('hier à 21:04');
+    expect(saidAt('2026-10-05', at(5, 9, 0), '2026-10-08')).toBe('le lundi 5 octobre à 09:00');
+  });
+});

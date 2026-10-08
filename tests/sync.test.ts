@@ -18,8 +18,11 @@ import { AppError } from '../src/lib/errors';
 import { createLocalDb, updateEntry } from '../src/lib/db';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings } from '../src/lib/settings';
 import { createSyncEngine, pendingCountOf } from '../src/lib/sync';
+import { collectDayLinks, linksSignature } from '../src/lib/mentions';
 import type {
   AiClient,
+  DayLink,
+  DayMention,
   DaySynthesis,
   DriveClient,
   DriveFileMeta,
@@ -204,7 +207,7 @@ function analysisFor(text: string): EntryAnalysis {
 class FakeAi implements AiClient {
   audioCalls: { mime: string; ctx: EntryContext }[] = [];
   textCalls: string[] = [];
-  synthCalls: { day: string; ids: string[] }[] = [];
+  synthCalls: { day: string; ids: string[]; links?: string[] }[] = [];
   fail: ((op: 'audio' | 'text' | 'synth', arg: string) => Error | undefined) | null = null;
 
   async analyzeAudio(audio: Blob, mimeType: string, ctx: EntryContext) {
@@ -222,17 +225,22 @@ class FakeAi implements AiClient {
     return analysisFor(text);
   }
 
-  async synthesizeDay(day: string, entries: Entry[]) {
-    this.synthCalls.push({ day, ids: entries.map((e) => e.id) });
+  async synthesizeDay(day: string, entries: Entry[], links?: DayLink[]) {
+    const call: { day: string; ids: string[]; links?: string[] } = { day, ids: entries.map((e) => e.id) };
+    if (links) call.links = links.map((l) => l.ref);
+    this.synthCalls.push(call);
     const err = this.fail?.('synth', day);
     if (err) throw err;
-    return {
+    const base = {
       summary: `Synthèse du ${day} (${entries.length})`,
       mood: { score: 1 as const, label: 'bien' },
       highlights: ['un moment'],
       themes: ['vie'],
       todos: [],
     };
+    const past = (links ?? []).filter((l) => l.mention.kind === 'past');
+    if (past.length === 0) return base;
+    return { ...base, mentionVerdicts: Object.fromEntries(past.map((l) => [l.ref, 'nouveau' as const])) };
   }
 
   async checkKey() {}
@@ -363,7 +371,10 @@ describe('createSyncEngine', () => {
     await b.sync.run();
 
     expect(b.ai.audioCalls).toHaveLength(1);
-    expect(b.ai.audioCalls[0]).toEqual({ mime: 'audio/webm', ctx: { day: '2026-10-08', time: '10:00' } });
+    expect(b.ai.audioCalls[0]).toEqual({
+      mime: 'audio/webm',
+      ctx: { day: '2026-10-08', time: '10:00', dayLinks: 'auto' },
+    });
     const e = await getEntry(b.db, 'v1');
     expect(e.transcript).toBe('Transcription de bonjour');
     expect(e.analysis?.title).toBe('Titre bonjour');
@@ -1289,5 +1300,480 @@ describe('createSyncEngine — compte Google', () => {
     expect(t.driveA.files.size).toBe(0);
     expect(t.sync.getStatus().lastError).toMatch(/n'a pas indiqué ton compte/);
     expect(await t.db.getKv('device.ownerEmail')).toBeUndefined();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Mentions d'autres jours (« Ajouté plus tard », « Prévu »)           */
+/* ------------------------------------------------------------------ */
+
+describe('createSyncEngine — notes d’autres jours', () => {
+  let b: Bench;
+  beforeEach(async () => {
+    b = await bench();
+  });
+
+  /** Entrée texte déjà analysée (à envoyer), avec d'éventuelles mentions. */
+  function analyzed(id: string, created: Date, text: string, mentions?: DayMention[]): LocalEntry {
+    const iso = created.toISOString();
+    const analysis = analysisFor(text);
+    if (mentions) analysis.mentions = mentions;
+    return {
+      id,
+      day: dayKey(created),
+      createdAt: iso,
+      updatedAt: iso,
+      source: 'text',
+      transcript: text,
+      analysis,
+      analysisModel: 'm',
+      analyzedAt: iso,
+      local: { dirty: true, needsAnalysis: false, hasLocalAudio: false, attempts: 0 },
+    };
+  }
+
+  function mention(id: string, day: string, over: Partial<DayMention> = {}): DayMention {
+    return { id, kind: 'past', day, when: 'avant-hier', text: `Fait ${id} au restaurant.`, status: 'auto', ...over };
+  }
+
+  const at = (d: number, h: number): Date => new Date(2026, 9, d, h, 0);
+  const callsFor = (day: string) => b.ai.synthCalls.filter((c) => c.day === day);
+
+  /** Geste de l'utilisateur sur une mention (comme le contrôleur : dirty, horodaté, sans toucher updatedAt). */
+  async function gesture(entryId: string, mentionId: string, patch: Partial<DayMention>): Promise<void> {
+    const decidedAt = new Date(b.clock.t).toISOString();
+    await updateEntry(b.db, entryId, (e) => ({
+      ...e,
+      analysis: e.analysis && {
+        ...e.analysis,
+        mentions: (e.analysis.mentions ?? []).map((m) => (m.id === mentionId ? { ...m, ...patch, decidedAt } : m)),
+      },
+      local: { ...e.local, dirty: true },
+    }));
+  }
+
+  /** Version Drive d'une entrée locale (sans l'état local). */
+  function toRemote(e: LocalEntry | Entry): Entry {
+    const copy: Entry & { local?: unknown } = { ...e };
+    delete copy.local;
+    return copy;
+  }
+
+  it('sans note : signature inchangée (aucune régénération au déploiement), synthèse sans notes', async () => {
+    const e = analyzed('d6', at(6, 20), 'Soirée cinéma.');
+    await b.db.putEntry(e);
+    await b.sync.run();
+    await b.sync.run();
+    expect(b.ai.synthCalls).toEqual([{ day: '2026-10-06', ids: ['d6'] }]);
+    expect((await b.db.getSynthesis('2026-10-06'))?.basedOn).toBe(entriesSignature([e]));
+    expect((await b.db.getSynthesis('2026-10-06'))?.mentionVerdicts).toBeUndefined();
+  });
+
+  it('fait raconté aujourd’hui sur un jour déjà synthétisé : rien aujourd’hui, UNE régénération demain ; geste → jour visé seul', async () => {
+    const d6 = analyzed('d6', at(6, 20), 'Soirée cinéma.');
+    await b.db.putEntry(d6);
+    await b.sync.run();
+    expect(callsFor('2026-10-06')).toHaveLength(1);
+
+    await b.db.putEntry(
+      analyzed('src', at(8, 9), "Avant-hier j'ai dîné avec Paul.", [mention('m1', '2026-10-06', { text: "J'ai dîné avec Paul." })]),
+    );
+    await b.sync.run();
+    expect(callsFor('2026-10-06')).toHaveLength(1); // reporté au lendemain
+
+    b.clock.t += DAY; // vendredi 9
+    await b.sync.run();
+    const d6Calls = callsFor('2026-10-06');
+    expect(d6Calls).toHaveLength(2);
+    expect(d6Calls[1]).toEqual({ day: '2026-10-06', ids: ['d6'], links: ['src/m1'] });
+    const s6 = await b.db.getSynthesis('2026-10-06');
+    expect(s6?.basedOn.startsWith(`${entriesSignature([d6])}+a1-`)).toBe(true);
+    expect(s6?.mentionVerdicts).toEqual({ 'src/m1': 'nouveau' });
+    // Les verdicts partent dans Drive avec la synthèse
+    expect(b.drive.json<DaySynthesis>('day-2026-10-06.json').mentionVerdicts).toEqual({ 'src/m1': 'nouveau' });
+    // Le jour de l'entrée source est synthétisé normalement, sans note
+    expect(callsFor('2026-10-08')).toEqual([{ day: '2026-10-08', ids: ['src'] }]);
+
+    await b.sync.run();
+    expect(b.ai.synthCalls).toHaveLength(3);
+
+    // Retirer la note : le jour visé est régénéré une fois, le jour de l'entrée ne bouge pas.
+    const before = await getEntry(b.db, 'src');
+    await gesture('src', 'm1', { status: 'dismissed' });
+    await b.sync.run();
+    expect(callsFor('2026-10-06')).toHaveLength(3);
+    expect(callsFor('2026-10-06')[2]?.links).toBeUndefined();
+    expect(callsFor('2026-10-08')).toHaveLength(1);
+    const after = await getEntry(b.db, 'src');
+    expect(after.updatedAt).toBe(before.updatedAt);
+    expect(after.local.dirty).toBe(false);
+    expect(b.drive.json<Entry>('entry-src.json').analysis?.mentions?.[0]?.status).toBe('dismissed');
+    expect((await b.db.getSynthesis('2026-10-06'))?.basedOn).toBe(entriesSignature([d6]));
+  });
+
+  it('trois entrées du jour sur un même jour visé : une seule régénération, le lendemain', async () => {
+    await b.db.putEntry(analyzed('d5', at(5, 20), 'Lundi soir.'));
+    await b.sync.run();
+    for (const [i, h] of [9, 12, 18].entries()) {
+      await b.db.putEntry(
+        analyzed(`s${i}`, at(8, h), `Lundi ${i}.`, [mention(`m${i}`, '2026-10-05', { when: 'lundi', text: `Chose ${i} lundi.` })]),
+      );
+      await b.sync.run();
+    }
+    expect(callsFor('2026-10-05')).toHaveLength(1);
+    b.clock.t += DAY;
+    await b.sync.run();
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(2);
+    expect(callsFor('2026-10-05')[1]?.links).toEqual(['s0/m0', 's1/m1', 's2/m2']);
+  });
+
+  it('jour visé généré aujourd’hui : sans les notes dites aujourd’hui (jamais de régénération le jour même), intégrées le lendemain ; source supprimée → régénérée sans', async () => {
+    const d5 = analyzed('d5', at(5, 20), 'Lundi soir.');
+    await b.db.putEntry(d5);
+    const says = (id: string, h: number, text: string) =>
+      analyzed(id, at(8, h), `Lundi dernier, ${text}`, [mention(`m-${id}`, '2026-10-05', { when: 'lundi dernier', text })]);
+    // Une note dite aujourd'hui sur un jour qui n'a pas encore de synthèse (entrée enregistrée hors ligne)
+    await b.db.putEntry(says('s1', 7, 'Piscine avec Léa.'));
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toEqual([{ day: '2026-10-05', ids: ['d5'] }]);
+    expect((await b.db.getSynthesis('2026-10-05'))?.basedOn).toBe(entriesSignature([d5]));
+    // D'autres notes dites aujourd'hui sur ce jour, puis un retrait : toujours rien aujourd'hui
+    await b.db.putEntry(says('s2', 12, 'Cinéma avec Hugo.'));
+    await b.sync.run();
+    await b.db.putEntry(says('s3', 18, 'Courses au marché couvert.'));
+    await b.sync.run();
+    await gesture('s3', 'm-s3', { status: 'dismissed' });
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(1);
+
+    // Lendemain : UNE régénération avec toutes les notes de la veille encore actives
+    b.clock.t += DAY;
+    await b.sync.run();
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(2);
+    expect(callsFor('2026-10-05')[1]).toEqual({ day: '2026-10-05', ids: ['d5'], links: ['s1/m-s1', 's2/m-s2'] });
+
+    // Suppression d'une entrée source (comme le contrôleur)
+    const src = await getEntry(b.db, 's1');
+    await b.db.setKv('sync.pendingDeletes', [src.local.driveFileId]);
+    await b.db.deleteEntry('s1');
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(3);
+    expect(callsFor('2026-10-05')[2]?.links).toEqual(['s2/m-s2']);
+  });
+
+  it('demande manuelle (« Régénérer ») : mêmes notes (celles dites avant aujourd’hui), rien de plus ensuite', async () => {
+    const d5 = analyzed('d5', at(5, 20), 'Lundi soir.');
+    await b.db.putEntry(d5);
+    await b.db.putEntry(analyzed('old', at(7, 9), 'Lundi, piscine.', [mention('m1', '2026-10-05', { when: 'lundi', text: 'Piscine.' })]));
+    await b.db.putEntry(analyzed('new', at(8, 9), 'Lundi, cinéma.', [mention('m2', '2026-10-05', { when: 'lundi', text: 'Cinéma.' })]));
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toEqual([{ day: '2026-10-05', ids: ['d5'], links: ['old/m1'] }]);
+    // « Régénérer » (comme le contrôleur)
+    await b.db.setKv('sync.forceSynthesisDays', ['2026-10-05']);
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(2);
+    expect(callsFor('2026-10-05')[1]?.links).toEqual(['old/m1']);
+    await b.db.putEntry(analyzed('new2', at(8, 11), 'Lundi, marché.', [mention('m3', '2026-10-05', { when: 'lundi', text: 'Marché couvert.' })]));
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(2);
+  });
+
+  it('même fait redit par une autre entrée : envoyé une fois, la répétition ne régénère rien ; l’original retiré → elle prend sa place', async () => {
+    b.clock.t = at(7, 10).getTime();
+    const d5 = analyzed('d5', at(5, 20), 'Lundi soir.');
+    await b.db.putEntry(d5);
+    await b.db.putEntry(
+      analyzed('s6', at(6, 9), 'Hier, restaurant.', [mention('m1', '2026-10-05', { when: 'hier', text: "J'ai dîné avec Paul au restaurant italien." })]),
+    );
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toEqual([{ day: '2026-10-05', ids: ['d5'], links: ['s6/m1'] }]);
+    await b.db.putEntry(
+      analyzed('s7', at(7, 9), 'Lundi, restaurant.', [
+        mention('m1', '2026-10-05', { when: 'lundi', text: 'Dîner avec Paul au restaurant italien.' }),
+      ]),
+    );
+    b.clock.t = at(8, 10).getTime();
+    await b.sync.run();
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(1);
+
+    await gesture('s6', 'm1', { status: 'dismissed' });
+    await b.sync.run();
+    expect(callsFor('2026-10-05')).toHaveLength(2);
+    expect(callsFor('2026-10-05')[1]?.links).toEqual(['s7/m1']);
+  });
+
+  it('synchro : un geste fait ici survit à une version distante plus récente ; un geste fait ailleurs survit à une version locale plus récente', async () => {
+    const src = analyzed('src', at(8, 9), 'Avant-hier, dîner. Hier, cinéma.', [
+      mention('m1', '2026-10-06', { text: 'Dîner chez Hugo.' }),
+      mention('m2', '2026-10-07', { when: 'hier', text: 'Cinéma avec Léa.' }),
+    ]);
+    await b.db.putEntry(src);
+    await b.sync.run();
+    const pushed = await getEntry(b.db, 'src');
+    const fileId = pushed.local.driveFileId ?? '';
+    const later = (h: number) => new Date(TODAY.getTime() + h * HOUR).toISOString();
+
+    // Ici : retrait de m1 (dirty, updatedAt inchangé). Ailleurs : m2 déplacée au lundi, puis
+    // correction ré-analysée (updatedAt plus récent) qui a gardé m1 « auto ».
+    await gesture('src', 'm1', { status: 'dismissed' });
+    const remoteVersion: Entry = {
+      ...toRemote(src),
+      transcript: 'Avant-hier, dîner. Hier, cinéma (corrigé).',
+      updatedAt: later(2),
+      analysis: {
+        ...analysisFor('corrigé'),
+        mentions: [
+          mention('m1', '2026-10-06', { text: 'Dîner chez Hugo.' }),
+          mention('m2', '2026-10-05', { when: 'hier', text: 'Cinéma avec Léa.', status: 'confirmed', decidedAt: later(1) }),
+        ],
+      },
+    };
+    b.drive.remoteEdit(fileId, JSON.stringify(remoteVersion));
+    await b.sync.run();
+
+    const merged = await getEntry(b.db, 'src');
+    expect(merged.transcript).toBe('Avant-hier, dîner. Hier, cinéma (corrigé).');
+    expect(merged.updatedAt).toBe(later(2));
+    expect(merged.analysis?.mentions?.map((m) => [m.id, m.day, m.status])).toEqual([
+      ['m1', '2026-10-06', 'dismissed'],
+      ['m2', '2026-10-05', 'confirmed'],
+    ]);
+    // Le retrait repart vers Drive
+    expect(merged.local.dirty).toBe(false);
+    expect(b.drive.json<Entry>('entry-src.json').analysis?.mentions?.[0]?.status).toBe('dismissed');
+
+    // Réciproque : version locale plus récente (corrigée ici) ; ailleurs, m2 a été retirée ensuite
+    // (geste plus récent que le déplacement reçu ici).
+    await updateEntry(b.db, 'src', (e) => ({ ...e, transcript: 'Corrigé ici.', updatedAt: later(4), local: { ...e.local, dirty: true } }));
+    const remote2 = b.drive.json<Entry>('entry-src.json');
+    const dismissedThere = (m: DayMention): DayMention =>
+      m.id === 'm2' ? { ...m, status: 'dismissed', decidedAt: later(3) } : m;
+    b.drive.remoteEdit(
+      fileId,
+      JSON.stringify({
+        ...remote2,
+        analysis: remote2.analysis && { ...remote2.analysis, mentions: (remote2.analysis.mentions ?? []).map(dismissedThere) },
+      }),
+    );
+    await b.sync.run();
+    const mine = await getEntry(b.db, 'src');
+    expect(mine.transcript).toBe('Corrigé ici.');
+    expect(mine.analysis?.mentions?.map((m) => [m.id, m.status])).toEqual([
+      ['m1', 'dismissed'],
+      ['m2', 'dismissed'],
+    ]);
+    expect(b.drive.json<Entry>('entry-src.json').transcript).toBe('Corrigé ici.');
+    expect(b.drive.json<Entry>('entry-src.json').analysis?.mentions?.[1]?.status).toBe('dismissed');
+  });
+
+  it('entrée source en attente d’une nouvelle analyse : jour visé gelé', async () => {
+    const d6 = analyzed('d6', at(6, 20), 'Soirée.');
+    await b.db.putEntry(d6);
+    await b.sync.run();
+    const src = analyzed('src', at(7, 21), 'Hier, dîner.', [mention('m1', '2026-10-06', { when: 'hier' })]);
+    // Corrigée puis analyse en échec : nouvel essai dans une heure
+    src.local = {
+      ...src.local,
+      needsAnalysis: true,
+      attempts: 1,
+      error: 'Oups',
+      errorKind: 'other',
+      retryAfter: new Date(TODAY.getTime() + HOUR).toISOString(),
+    };
+    await b.db.putEntry(src);
+    await b.sync.run();
+    expect(callsFor('2026-10-06')).toHaveLength(1);
+
+    await updateEntry(b.db, 'src', (e) => ({ ...e, local: { ...e.local, needsAnalysis: false, error: undefined, errorKind: undefined } }));
+    await b.sync.run();
+    expect(callsFor('2026-10-06')).toHaveLength(2);
+  });
+
+  it('pull : les mentions et les verdicts sont conservés (verdicts invalides ignorés)', async () => {
+    const remote = (e: LocalEntry): Entry => {
+      const copy: Entry & { local?: unknown } = { ...e };
+      delete copy.local;
+      return copy;
+    };
+    const t6 = remote(analyzed('t6', at(6, 20), 'Soirée.'));
+    const src = remote(analyzed('src', at(7, 21), 'Hier, dîner.', [mention('m1', '2026-10-06', { when: 'hier' })]));
+    b.drive.seedAppData('entry-t6.json', JSON.stringify(t6), { kind: 'entry', day: t6.day, entryId: 't6' });
+    b.drive.seedAppData('entry-src.json', JSON.stringify(src), { kind: 'entry', day: src.day, entryId: 'src' });
+    const links = collectDayLinks([src]).get('2026-10-06') ?? [];
+    const synth: DaySynthesis = {
+      day: '2026-10-06',
+      generatedAt: new Date(2026, 9, 7, 9, 0).toISOString(),
+      model: 'm',
+      basedOn: linksSignature(entriesSignature([t6]), links),
+      summary: 'Synthèse distante.',
+      mood: { score: 1, label: 'bien' },
+      highlights: [],
+      themes: [],
+      todos: [],
+      mentionVerdicts: { 'src/m1': 'deja', 'x/y': 'bof' as 'deja' },
+    };
+    b.drive.seedAppData('day-2026-10-06.json', JSON.stringify(synth), { kind: 'synthesis', day: '2026-10-06' });
+
+    await b.sync.run();
+    expect((await getEntry(b.db, 'src')).analysis?.mentions).toEqual(src.analysis?.mentions);
+    const local = await b.db.getSynthesis('2026-10-06');
+    expect(local?.mentionVerdicts).toEqual({ 'src/m1': 'deja' });
+    expect(callsFor('2026-10-06')).toEqual([]);
+  });
+
+  it('miroir : un jour qui n’a que des notes a son fichier (retiré avec la note) ; jamais de fichier pour un jour à venir', async () => {
+    await b.db.putEntry(
+      analyzed('src', at(8, 9), 'Samedi dernier mer. Lundi prochain dentiste.', [
+        mention('m1', '2026-10-03', { when: 'samedi dernier' }),
+        mention('m2', '2026-10-12', { kind: 'future', when: 'lundi prochain', text: 'Dentiste.' }),
+      ]),
+    );
+    await b.sync.run();
+    expect(b.drive.mirrorFile('2026-10-03')).toBeDefined();
+    expect(b.drive.mirrorFile('2026-10-12')).toBeUndefined();
+    expect(b.drive.mirrorFile('2026-10-08')).toBeDefined();
+    // Jour sans entrée : pas de synthèse
+    expect(callsFor('2026-10-03')).toEqual([]);
+
+    await gesture('src', 'm1', { status: 'dismissed' });
+    await b.sync.run();
+    expect(b.drive.mirrorFile('2026-10-03')).toBeUndefined();
+
+    // Le jour prévu arrive : son fichier apparaît
+    b.clock.t += 4 * DAY;
+    await b.sync.run();
+    expect(b.drive.mirrorFile('2026-10-12')).toBeDefined();
+  });
+
+  it('nouvelle analyse (correction) : les choix de l’utilisateur sont conservés, un ajout retiré ne revient pas', async () => {
+    const e = analyzed('e1', at(8, 9), 'Texte.', [
+      mention('c1', '2026-10-03', { when: 'le week-end dernier', text: 'Mer.', status: 'confirmed' }),
+      mention('d1', '2026-10-07', { when: 'hier', text: "J'ai vu Paul au café.", status: 'dismissed' }),
+      mention('a1', '2026-10-06', { when: 'avant-hier', text: 'Cinéma.' }),
+    ]);
+    e.transcriptEdited = true;
+    e.local = { ...e.local, needsAnalysis: true };
+    await b.db.putEntry(e);
+    b.ai.analyzeText = async (text: string) => ({
+      ...analysisFor(text),
+      mentions: [
+        mention('n1', '2026-10-07', { when: 'hier', text: "J'ai vu Paul au café, sympa." }),
+        mention('n2', '2026-10-09', { kind: 'future', when: 'demain', text: 'Piscine.' }),
+      ],
+    });
+    await b.sync.run();
+    const after = await getEntry(b.db, 'e1');
+    expect(after.analysis?.mentions?.map((m) => [m.id, m.status])).toEqual([
+      ['c1', 'confirmed'],
+      ['d1', 'dismissed'],
+      ['n2', 'auto'],
+    ]);
+  });
+
+  it('plafond de 7 synthèses par cycle : les jours qui ne changent que par des notes passent en dernier', async () => {
+    const old = analyzed('o', new Date(2026, 8, 30, 20, 0), 'Fin septembre.');
+    await b.db.putEntry({ ...old, local: { ...old.local, dirty: false } });
+    await b.db.putSynthesis({
+      day: '2026-09-30',
+      generatedAt: TODAY.toISOString(),
+      model: 'm',
+      basedOn: entriesSignature([old]),
+      summary: 'Avant.',
+      mood: { score: 0, label: 'neutre' },
+      highlights: [],
+      themes: [],
+      todos: [],
+      local: { dirty: false },
+    });
+    for (let d = 1; d <= 7; d++) {
+      const mentions = d === 7 ? [mention('m', '2026-09-30', { when: 'mercredi dernier' })] : undefined;
+      await b.db.putEntry(analyzed(`j${d}`, at(d, 20), `Jour ${d}.`, mentions));
+    }
+    await b.sync.run();
+    expect(b.ai.synthCalls.map((c) => c.day)).toEqual([
+      '2026-10-07',
+      '2026-10-06',
+      '2026-10-05',
+      '2026-10-04',
+      '2026-10-03',
+      '2026-10-02',
+      '2026-10-01',
+    ]);
+    await b.sync.run();
+    expect(callsFor('2026-09-30')).toEqual([{ day: '2026-09-30', ids: ['o'], links: ['j7/m'] }]);
+  });
+
+  it('signature d’une version plus récente (suffixe inconnu) : pas de régénération automatique', async () => {
+    const e = analyzed('d6', at(6, 20), 'Soirée.');
+    await b.db.putEntry(e);
+    await b.db.putSynthesis({
+      day: '2026-10-06',
+      generatedAt: TODAY.toISOString(),
+      model: 'm',
+      basedOn: `${entriesSignature([e])}+z9-futur`,
+      summary: 'x',
+      mood: { score: 0, label: 'neutre' },
+      highlights: [],
+      themes: [],
+      todos: [],
+      local: { dirty: false },
+    });
+    await b.sync.run();
+    expect(b.ai.synthCalls).toEqual([]);
+  });
+});
+
+describe('createSyncEngine — « Rattacher aux autres jours » désactivé', () => {
+  it('requêtes sans détection, notes déjà intégrées laissées telles quelles, mentions gardées à la ré-analyse', async () => {
+    const b = await bench({ geminiApiKey: 'CLE', dayLinks: 'off' });
+    const iso = (d: number, h: number) => new Date(2026, 9, d, h, 0).toISOString();
+    const d6: LocalEntry = {
+      id: 'd6',
+      day: '2026-10-06',
+      createdAt: iso(6, 20),
+      updatedAt: iso(6, 20),
+      source: 'text',
+      transcript: 'Soirée.',
+      analysis: analysisFor('Soirée.'),
+      local: { dirty: false, needsAnalysis: false, hasLocalAudio: false, attempts: 0 },
+    };
+    const m: DayMention = { id: 'm1', kind: 'past', day: '2026-10-06', when: 'hier', text: 'Dîner.', status: 'auto' };
+    const src: LocalEntry = {
+      ...d6,
+      id: 'src',
+      day: '2026-10-07',
+      createdAt: iso(7, 21),
+      updatedAt: iso(7, 21),
+      transcript: 'Hier, dîner.',
+      analysis: { ...analysisFor('Hier, dîner.'), mentions: [m] },
+      transcriptEdited: true,
+      local: { dirty: true, needsAnalysis: true, hasLocalAudio: false, attempts: 0 },
+    };
+    await b.db.putEntry(d6);
+    await b.db.putEntry(src);
+    await b.db.putSynthesis({
+      day: '2026-10-06',
+      generatedAt: TODAY.toISOString(),
+      model: 'm',
+      basedOn: linksSignature(entriesSignature([d6]), collectDayLinks([src]).get('2026-10-06') ?? []),
+      summary: 'Avec la note.',
+      mood: { score: 0, label: 'neutre' },
+      highlights: [],
+      themes: [],
+      todos: [],
+      local: { dirty: false },
+    });
+    await addVoice(b.db, voiceEntry('v1', TODAY));
+    await b.sync.run();
+    expect(b.ai.audioCalls[0]?.ctx).toEqual({ day: '2026-10-08', time: '10:00', dayLinks: 'off' });
+    // Pas de régénération pour des notes
+    expect(b.ai.synthCalls.filter((c) => c.day === '2026-10-06')).toEqual([]);
+    // Ré-analyse sans détection : la mention existante est gardée telle quelle
+    expect((await getEntry(b.db, 'src')).analysis?.mentions).toEqual([m]);
+    // Le jour de l'entrée source est synthétisé sans note
+    expect(b.ai.synthCalls.find((c) => c.day === '2026-10-07')?.links).toBeUndefined();
   });
 });

@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Entry, EntryContext } from '../src/lib/types';
+import type { DayLink, Entry, EntryContext } from '../src/lib/types';
 import { AppError } from '../src/lib/errors';
 import { createMockDriveClient, type MockDriveClient } from '../src/lib/mock/drive';
-import { createMockAiClient, mockAnalyzeText, mockSynthesizeDay } from '../src/lib/mock/ai';
+import { createMockAiClient, mockAnalyzeText, mockDetectMentions, mockSynthesizeDay } from '../src/lib/mock/ai';
 import { createMockAuth, MOCK_EMAIL, MOCK_TOKEN, type MockAuthStorage } from '../src/lib/mock/auth';
 import { createSilentWav, createSimulatedRecorder } from '../src/lib/mock/recorder';
 import { seedDemoDrive } from '../src/lib/mock/seed';
@@ -557,5 +557,73 @@ describe('enregistreur de démo (createMockServices().createRecorder)', () => {
     await cancelled;
     expect(rec.status).toBe('idle');
     expect(stopped).toEqual(['piste']);
+  });
+});
+
+describe('mock Gemini — mentions d’autres jours (démo)', () => {
+  const ctx: EntryContext = { day: '2026-10-08', time: '21:15', dayLinks: 'auto' };
+
+  it('expressions simples reconnues, puis la même validation que les vraies réponses', () => {
+    const text =
+      "Avant-hier j'ai dîné avec Paul au restaurant. Demain je vais chez le dentiste à 10 h. " +
+      'Le week-end dernier on est allés à la mer. Il y a trois jours, réunion difficile. ' +
+      'Dans 5 jours je pars à Nantes.';
+    const mentions = mockDetectMentions(text, ctx);
+    expect(mentions.map((m) => [m.when, m.status, m.day, m.choices ?? null, m.text])).toEqual([
+      ['Avant-hier', 'auto', '2026-10-06', null, "J'ai dîné avec Paul au restaurant."],
+      ['Demain', 'auto', '2026-10-09', null, 'Je vais chez le dentiste à 10 h.'],
+      ['Le week-end dernier', 'proposed', '', ['2026-10-03', '2026-10-04'], 'On est allés à la mer.'],
+      ['Il y a trois jours', 'auto', '2026-10-05', null, 'Réunion difficile.'],
+      ['Dans 5 jours', 'auto', '2026-10-13', null, 'Je pars à Nantes.'],
+    ]);
+    expect(mockAnalyzeText(text, ctx).mentions).toEqual(mentions);
+  });
+
+  it('jour de la semaine seul : date selon le temps du verbe ; « dernier » / « prochain »', () => {
+    const at = (t: string) => mockDetectMentions(t, ctx)[0];
+    expect(at("Lundi j'ai vu Hugo.")).toMatchObject({ day: '2026-10-05', status: 'auto', kind: 'past' });
+    expect(at('Lundi je vais voir Hugo.')).toMatchObject({ day: '2026-10-12', status: 'auto', kind: 'future' });
+    expect(at('Lundi, Hugo.')).toMatchObject({ status: 'proposed', choices: ['2026-10-05', '2026-10-12'] });
+    expect(at('Samedi dernier, fête chez Léa.')).toMatchObject({ day: '2026-10-03', status: 'auto' });
+    expect(at('Lundi prochain je commence le yoga.')).toMatchObject({ day: '2026-10-12', status: 'auto' });
+  });
+
+  it('rien sans détection active, pour une échéance, ou pour le jour même', () => {
+    expect(mockDetectMentions('Demain dentiste.', { ...ctx, dayLinks: 'off' })).toEqual([]);
+    expect(mockDetectMentions('Demain dentiste.', { day: '2026-10-08', time: '10:00' })).toEqual([]);
+    expect(mockAnalyzeText('Demain dentiste.').mentions).toBeUndefined();
+    expect(mockDetectMentions('Je dois finir le dossier avant vendredi.', ctx)).toEqual([]);
+    expect(mockDetectMentions('Ce soir, cinéma. Ce matin, café.', ctx)).toEqual([]);
+  });
+
+  it('synthèse avec notes : prévu jamais présenté comme arrivé, verdicts déterministes', async () => {
+    const day: Entry = {
+      id: 'd',
+      day: '2026-10-06',
+      createdAt: '2026-10-06T19:00:00.000Z',
+      updatedAt: '2026-10-06T19:00:00.000Z',
+      source: 'text',
+      transcript: "J'ai dîné avec Paul au restaurant, c'était bien.",
+      analysis: mockAnalyzeText("J'ai dîné avec Paul au restaurant, c'était bien."),
+    };
+    const link = (ref: string, kind: 'past' | 'future', text: string): DayLink => ({
+      entryId: ref.split('/')[0] ?? '',
+      sourceDay: '2026-10-08',
+      sourceCreatedAt: '2026-10-08T07:00:00.000Z',
+      mention: { id: ref.split('/')[1] ?? '', kind, day: '2026-10-06', when: 'x', text, status: 'auto' },
+      ref,
+    });
+    const ai = createMockAiClient({ latencyMs: 0 });
+    const s = await ai.synthesizeDay('2026-10-06', [day], [
+      link('a/1', 'past', "J'ai dîné avec Paul au restaurant."),
+      link('b/2', 'past', 'Ensuite balade sur les quais.'),
+      link('c/3', 'future', 'Dentiste à 10 h.'),
+    ]);
+    expect(s.mentionVerdicts).toEqual({ 'a/1': 'deja', 'b/2': 'nouveau' });
+    expect(s.summary).toContain("C'était prévu : Dentiste à 10 h.");
+    expect(s.summary).toContain('Raconté plus tard : Ensuite balade sur les quais.');
+    expect(s.summary).not.toContain('Raconté plus tard : J\'ai dîné');
+    const plain = await ai.synthesizeDay('2026-10-06', [day]);
+    expect(plain.mentionVerdicts).toBeUndefined();
   });
 });

@@ -1,6 +1,7 @@
 import { config } from '../config';
 import { renderDayMarkdown } from './markdown';
-import type { DayKey, DaySynthesis, Entry, LocalDb, LocalEntry, LocalSynthesis, Settings } from './types';
+import { collectDayLinks } from './mentions';
+import type { DayKey, DayLink, DaySynthesis, Entry, LocalDb, LocalEntry, LocalSynthesis, Settings } from './types';
 import { dayKey, formatDayFr, timeHHmm } from './util';
 import { createZip, type ZipInput } from './zip';
 
@@ -109,7 +110,13 @@ export async function buildExportZip(
     else byDay.set(e.day, [e]);
   }
   const synthesisByDay = new Map<DayKey, DaySynthesis>(syntheses.map((s) => [s.day, s]));
-  const days = [...new Set<DayKey>([...byDay.keys(), ...synthesisByDay.keys()])].sort();
+  // Notes d'autres jours (« Rattacher aux autres jours » actif) : les jours qui n'ont que des notes
+  // ont aussi leur page, sauf les jours à venir.
+  const linksOn = settings?.dayLinks !== 'off';
+  const linksByDay = linksOn ? collectDayLinks(entries) : new Map<DayKey, DayLink[]>();
+  const exportDay = dayKey(now);
+  const linkDays = [...linksByDay.keys()].filter((d) => d <= exportDay);
+  const days = [...new Set<DayKey>([...byDay.keys(), ...synthesisByDay.keys(), ...linkDays])].sort();
 
   const retention =
     typeof settings?.audioRetentionDays === 'number' && settings.audioRetentionDays > 0
@@ -123,7 +130,12 @@ export async function buildExportZip(
   for (const day of days) {
     files.push({
       path: `markdown/${day.slice(0, 4)}/${day}.md`,
-      data: renderDayMarkdown(day, byDay.get(day) ?? [], synthesisByDay.get(day)),
+      data: renderDayMarkdown(
+        day,
+        byDay.get(day) ?? [],
+        synthesisByDay.get(day),
+        linksOn ? (linksByDay.get(day) ?? []) : undefined,
+      ),
       date: now,
     });
   }

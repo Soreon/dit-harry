@@ -28,6 +28,69 @@ export interface EntryAnalysis {
   people: string[];
   places: string[];
   todos: string[];
+  /**
+   * Faits que l'entrée situe sur un AUTRE jour précis (« avant-hier », « demain »…), rattachés à
+   * ce jour-là. Facultatif (absent des entrées plus anciennes ou sans mention). Voir SPEC §16.
+   */
+  mentions?: DayMention[];
+}
+
+/** past : fait raconté après coup (jour visé < jour de l'entrée) ; future : chose prévue. */
+export type DayMentionKind = 'past' | 'future';
+
+/**
+ * auto : rattaché d'office (repère sans ambiguïté) ; proposed : jour à choisir parmi `choices` ;
+ * confirmed : choisi, déplacé ou corrigé par l'utilisateur ; dismissed : retiré par l'utilisateur.
+ * Seuls auto et confirmed apparaissent sur le jour visé. confirmed et dismissed survivent à une
+ * nouvelle analyse de l'entrée.
+ */
+export type DayMentionStatus = 'auto' | 'proposed' | 'confirmed' | 'dismissed';
+
+/** Mention d'un autre jour, portée par l'entrée qui la contient (jamais copiée ailleurs). */
+export interface DayMention {
+  /** 8 caractères, stable (interface, références des synthèses). */
+  id: string;
+  kind: DayMentionKind;
+  /** Jour visé ; '' tant qu'une proposition n'est pas tranchée. */
+  day: DayKey;
+  /** Repère de temps tel que dit (≤ 60 caractères), ex. « avant-hier ». */
+  when: string;
+  /** Le fait, en 1 ou 2 phrases à la première personne (≤ 300 caractères). */
+  text: string;
+  status: DayMentionStatus;
+  /** Jours possibles d'une proposition (1 à 3). */
+  choices?: DayKey[];
+  /** Date donnée par le modèle pour une proposition : toujours parmi `choices`, choix suggéré. */
+  modelDay?: DayKey;
+  /**
+   * Moment du dernier geste de l'utilisateur sur cette mention (choisir, déplacer, modifier,
+   * retirer, rétablir). Les gestes ne touchent pas `updatedAt` : c'est lui qui départage deux
+   * appareils qui ont chacun changé la même mention.
+   */
+  decidedAt?: ISODate;
+}
+
+/** Réglage « Rattacher aux autres jours » : automatique (défaut) ou désactivé. */
+export type DayLinksMode = 'auto' | 'off';
+
+/** Verdict de la synthèse du jour visé sur un fait raconté plus tard. */
+export type MentionVerdict = 'nouveau' | 'complete' | 'deja';
+
+/**
+ * Mention active d'une entrée, vue depuis le jour qu'elle vise. Dérivée des entrées à la
+ * lecture (`collectDayLinks`), jamais stockée.
+ */
+export interface DayLink {
+  entryId: string;
+  /** Jour de l'entrée qui contient la mention. */
+  sourceDay: DayKey;
+  sourceCreatedAt: ISODate;
+  /** `kind` recalculé d'après le jour visé. */
+  mention: DayMention;
+  /** `${entryId}/${mention.id}` : clé des verdicts de synthèse et de l'interface. */
+  ref: string;
+  /** Même fait déjà rattaché à ce jour par une entrée précédente (sa `ref`). */
+  repeatOf?: string;
 }
 
 export type EntrySource = 'voice' | 'text';
@@ -105,6 +168,11 @@ export interface DaySynthesis {
   highlights: string[];
   themes: string[];
   todos: string[];
+  /**
+   * Faits racontés plus tard intégrés à cette synthèse : `ref` (`${entryId}/${mentionId}`) →
+   * verdict (nouveau, complète, déjà présent). Facultatif.
+   */
+  mentionVerdicts?: Record<string, MentionVerdict>;
 }
 
 export interface SynthesisLocalState {
@@ -128,6 +196,8 @@ export interface Settings {
   /** Copie automatique en Markdown dans un dossier Drive visible « Dit Harry ». */
   mirrorEnabled: boolean;
   audioRetentionDays: number;
+  /** « Rattacher aux autres jours » (absent = 'auto'). */
+  dayLinks?: DayLinksMode;
   updatedAt: ISODate;
 }
 
@@ -267,7 +337,17 @@ export interface EntryContext {
   day: DayKey;
   /** Heure locale 'HH:mm'. */
   time: string;
+  /**
+   * 'auto' : détecter les mentions d'autres jours (consigne, repères et champ `mentions`).
+   * Absent ou 'off' : requête sans rien de tout cela (0 token de plus).
+   */
+  dayLinks?: DayLinksMode;
 }
+
+/** Résultat d'une synthèse de jour (verdicts seulement si des faits racontés plus tard sont fournis). */
+export type SynthesisResult = Pick<DaySynthesis, 'summary' | 'mood' | 'highlights' | 'themes' | 'todos'> & {
+  mentionVerdicts?: Record<string, MentionVerdict>;
+};
 
 export interface AiClient {
   /** Audio → transcription nettoyée + analyse, en un seul appel (modèle d'entrée). */
@@ -278,11 +358,11 @@ export interface AiClient {
   ): Promise<{ transcript: string; analysis: EntryAnalysis }>;
   /** Texte (saisi ou corrigé) → analyse (modèle d'entrée). */
   analyzeText(text: string, ctx: EntryContext): Promise<EntryAnalysis>;
-  /** Entrées analysées d'un jour → synthèse (modèle de synthèse). */
-  synthesizeDay(
-    day: DayKey,
-    entries: Entry[],
-  ): Promise<Pick<DaySynthesis, 'summary' | 'mood' | 'highlights' | 'themes' | 'todos'>>;
+  /**
+   * Entrées analysées d'un jour → synthèse (modèle de synthèse). `links` : notes d'autres jours
+   * qui visent ce jour (faits racontés plus tard, choses prévues) ; facultatif.
+   */
+  synthesizeDay(day: DayKey, entries: Entry[], links?: DayLink[]): Promise<SynthesisResult>;
   /** Vérifie la clé (appel léger). Lève AppError('invalid-key') si refusée. */
   checkKey(): Promise<void>;
 }

@@ -1,5 +1,7 @@
 <script lang="ts">
   import { useApp } from '../lib/app.svelte';
+  import { linksSignature, settledLinks, splitSignature } from '../lib/mentions';
+  import { entriesSignature } from '../lib/util';
   import type { DayGroup } from './helpers';
   import { formatRelative, hasSynthesisContent, moodEmoji, splitParagraphs } from './helpers';
   import Icon from './Icon.svelte';
@@ -16,6 +18,25 @@
   const analyzed = $derived(group.entries.filter((e) => e.analysis && e.transcript.trim() !== '').length);
   const content = $derived(hasSynthesisContent(group.entries));
   const waiting = $derived(group.entries.some((e) => e.local.needsAnalysis));
+
+  /**
+   * Notes d'autres jours (faits racontés plus tard, choses prévues) : intégrées à la synthèse
+   * existante, ou à venir (même règle que la synchro : celles dites aujourd'hui, demain).
+   */
+  const linksNote = $derived.by(() => {
+    const links = group.links ?? [];
+    if (!s || links.length === 0 || group.day >= app.today) return '';
+    const analyzedEntries = group.entries.filter((e) => e.analysis && e.transcript.trim() !== '');
+    const base = entriesSignature(analyzedEntries);
+    if (splitSignature(s.basedOn).base !== base) return '';
+    const n = links.length;
+    if (s.basedOn === linksSignature(base, links)) {
+      return n === 1 ? "Tient compte d'une note d'un autre jour." : `Tient compte de ${n} notes d'autres jours.`;
+    }
+    return s.basedOn === linksSignature(base, settledLinks(links, app.today))
+      ? "Mise à jour demain avec ce qui a été dit d'autres jours."
+      : "Mise à jour à la prochaine synchronisation avec ce qui a été dit d'autres jours.";
+  });
 
   /** Raison pour laquelle on ne peut pas générer maintenant (sinon ''). */
   const blocker = $derived.by(() => {
@@ -71,6 +92,7 @@
         De nouvelles entrées attendent leur analyse : la synthèse sera mise à jour ensuite.
       </p>
     {/if}
+    {#if linksNote}<p class="muted small">{linksNote}</p>{/if}
   {:else if requested}
     <p class="placeholder"><span class="spinner" aria-hidden="true"></span> J'écris la synthèse…</p>
   {:else if !content}

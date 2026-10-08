@@ -11,6 +11,16 @@ import { toAppError } from './errors';
 import { promptInstall } from './install.svelte';
 import { LockController } from './lock.svelte';
 import { isMediaPlaying, type PasskeyAuthenticator } from './lock';
+import {
+  activeMentions,
+  collectDayLinks,
+  editMention,
+  isChoosableDay,
+  pendingProposals,
+  readMentions,
+  restoreMention,
+  settleMention,
+} from './mentions';
 import { createWebAuthnAuthenticator } from './passkey';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings as storeSettings } from './settings';
 import { KV_DEVICE_OWNER, hasLocalJournal, pendingCountOf } from './sync';
@@ -18,6 +28,8 @@ import type {
   AccountConflict,
   AuthState,
   DayKey,
+  DayLink,
+  DayMention,
   EntryLocalState,
   LocalEntry,
   LocalSynthesis,
@@ -28,8 +40,17 @@ import type {
   SyncStatus,
   VoiceRecorder,
 } from './types';
-import { audioExtension, dayKey, newId, sleep, stripMimeParams } from './util';
-import { groupDays, parseRoute, routeHash, type DayGroup, type Route } from '../components/helpers';
+import { addDays, audioExtension, dayKey, newId, sleep, stripMimeParams } from './util';
+import { MAX_FUTURE_DAYS } from './when';
+import {
+  formatDayLong,
+  groupDays,
+  parseRoute,
+  routeHash,
+  sameScreen,
+  type DayGroup,
+  type Route,
+} from '../components/helpers';
 
 export interface Toast {
   id: number;
@@ -168,8 +189,29 @@ export class AppController {
   resolvingConflict = $state(false);
 
   /* --- Dérivés ------------------------------------------------------- */
-  days: DayGroup[] = $derived(groupDays(this.entries, this.syntheses));
+  /** « Rattacher aux autres jours » actif (sinon les notes existantes sont masquées, pas effacées). */
+  dayLinksOn: boolean = $derived(this.settings.dayLinks !== 'off');
+  /** Notes d'autres jours, par jour visé (« Ajouté plus tard », « Prévu »). */
+  dayLinks: ReadonlyMap<DayKey, DayLink[]> = $derived(
+    this.dayLinksOn ? collectDayLinks(this.entries) : new Map<DayKey, DayLink[]>(),
+  );
+  days: DayGroup[] = $derived(groupDays(this.entries, this.syntheses, this.dayLinks));
   todayEntries: LocalEntry[] = $derived(this.days.find((d) => d.day === this.today)?.entries ?? []);
+  /** Choses prévues pour aujourd'hui (annoncées dans des entrées précédentes). */
+  todayPlanned: DayLink[] = $derived(
+    (this.dayLinks.get(this.today) ?? []).filter((l) => l.mention.kind === 'future'),
+  );
+  /** Jours à venir (60 jours au plus) qui ont des choses prévues, du plus proche au plus lointain. */
+  upcomingDays: DayGroup[] = $derived(
+    this.days
+      .filter(
+        (g) =>
+          g.day > this.today &&
+          g.day <= addDays(this.today, MAX_FUTURE_DAYS) &&
+          (g.links ?? []).some((l) => l.mention.kind === 'future'),
+      )
+      .reverse(),
+  );
   pendingCount: number = $derived(pendingCountOf(this.entries));
   hasKey: boolean = $derived(this.settings.geminiApiKey.trim() !== '');
   /** Un compte Google est connu sur cet appareil (même si le jeton a expiré). */
@@ -208,6 +250,11 @@ export class AppController {
   /** Notifications arrivées pendant le verrouillage (minuterie pas encore lancée). */
   private heldToasts: { id: number; ms: number }[] = [];
   private previousHash = '';
+  /**
+   * Début de la session : seules les entrées analysées après lui annoncent leurs rattachements
+   * (« Noté aussi au… »), pas tout l'historique tiré au premier cycle.
+   */
+  private readonly sessionStart = new Date().toISOString();
 
   constructor(services: Services, opts: AppControllerOptions = {}) {
     this.services = services;
@@ -362,9 +409,12 @@ export class AppController {
   /* Navigation                                                          */
   /* ================================================================== */
 
-  /** Remonte vers `target` (ex. '#/journal') ; utilise l'historique si on en vient. */
+  /**
+   * Remonte vers `target` (ex. '#/journal') ; utilise l'historique si on vient de cet écran (même
+   * jour, même mis en évidence autrement : `#/jour/…?e=…`).
+   */
   goUp(target: string): void {
-    if (this.previousHash === routeHash(parseRoute(target))) history.back();
+    if (this.previousHash && sameScreen(parseRoute(this.previousHash), parseRoute(target))) history.back();
     else location.hash = target;
   }
 
@@ -388,6 +438,7 @@ export class AppController {
           loadSettings(db),
           db.getKv<unknown>(KV_DEVICE_OWNER),
         ]);
+        if (settings.dayLinks !== 'off') this.announceMentions(this.entries, entries);
         this.entries = entries;
         this.syntheses = Object.fromEntries(syntheses.map((s) => [s.day, s]));
         this.deviceOwner = typeof owner === 'string' && owner ? owner : null;
@@ -398,6 +449,37 @@ export class AppController {
       this.reloading = null;
     });
     return this.reloading;
+  }
+
+  /**
+   * Une analyse vient de se terminer pendant la session : un seul toast pour ses rattachements
+   * (« Noté aussi au mardi 6 octobre. »), et pour les jours qui restent à choisir.
+   */
+  private announceMentions(prev: readonly LocalEntry[], next: readonly LocalEntry[]): void {
+    const before = new Map(prev.map((e) => [e.id, e.analyzedAt]));
+    const added: DayMention[] = [];
+    let toChoose = 0;
+    for (const e of next) {
+      if (!e.analyzedAt || e.analyzedAt < this.sessionStart || before.get(e.id) === e.analyzedAt) continue;
+      added.push(...activeMentions(e).filter((m) => m.status === 'auto'));
+      toChoose += pendingProposals(e).length;
+    }
+    const parts: string[] = [];
+    const [first] = added;
+    if (added.length === 1 && first) {
+      const day = formatDayLong(first.day, this.today);
+      parts.push(first.kind === 'past' ? `Noté aussi au ${day}.` : `Noté aussi pour le ${day} (prévu).`);
+    } else if (added.length > 1) {
+      parts.push(`Noté aussi à ${added.length} autres jours.`);
+    }
+    if (toChoose > 0) {
+      parts.push(
+        toChoose === 1
+          ? 'Un autre jour est mentionné : choisis-le dans l’entrée.'
+          : `${toChoose} autres jours sont mentionnés : choisis-les dans l’entrée.`,
+      );
+    }
+    if (parts.length > 0) this.toast(parts.join(' '), 'info', 5000);
   }
 
   getEntry(id: string): LocalEntry | undefined {
@@ -892,6 +974,82 @@ export class AppController {
     if (!saved) return;
     await this.reload();
     await this.runSync({ force: true });
+  }
+
+  /* ================================================================== */
+  /* Mentions d'autres jours (« Ajouté plus tard », « Prévu »)           */
+  /* ================================================================== */
+
+  /**
+   * Geste sur une mention de l'entrée `entryId`. L'entrée est renvoyée (`dirty`) SANS toucher à
+   * `updatedAt`, comme un champ technique : la synthèse du jour de l'entrée ne bouge pas, seule
+   * celle du jour visé change (par son contenu). Renvoie la mention modifiée, ou null.
+   */
+  private async patchMention(
+    entryId: string,
+    mentionId: string,
+    fn: (m: DayMention, entry: LocalEntry) => DayMention | null,
+  ): Promise<DayMention | null> {
+    const out: { mention?: DayMention } = {};
+    const saved = await updateEntry(this.services.db, entryId, (e) => {
+      if (!e.analysis) return null;
+      const list = readMentions(e.analysis);
+      const i = list.findIndex((m) => m.id === mentionId);
+      const cur = list[i];
+      if (!cur) return null;
+      const changed = fn(cur, e);
+      if (!changed) return null;
+      // Horodaté : départage ce geste d'un autre fait sur un autre appareil (synchro).
+      const next: DayMention = { ...changed, decidedAt: new Date().toISOString() };
+      out.mention = next;
+      const mentions = list.map((m, j) => (j === i ? next : m));
+      return { ...e, analysis: { ...e.analysis, mentions }, local: { ...e.local, dirty: true } };
+    });
+    if (!saved || !out.mention) return null;
+    await this.reload();
+    void this.runSync();
+    return out.mention;
+  }
+
+  /** Choisit le jour d'une proposition, ou déplace un rattachement (« Changer de jour »). */
+  async setMentionDay(entryId: string, mentionId: string, day: DayKey): Promise<boolean> {
+    const m = await this.patchMention(entryId, mentionId, (cur, e) =>
+      isChoosableDay(day, e.day, cur.choices) ? settleMention(cur, day, e.day) : null,
+    );
+    if (!m) {
+      this.toast('Ce jour ne peut pas être choisi pour cette entrée.', 'error');
+      return false;
+    }
+    const label = formatDayLong(day, this.today);
+    this.toast(m.kind === 'past' ? `Ajouté au ${label}.` : `Prévu le ${label}.`, 'success');
+    return true;
+  }
+
+  /** Corrige le texte d'un rattachement (il devient « confirmé »). */
+  async editMentionText(entryId: string, mentionId: string, text: string): Promise<boolean> {
+    const m = await this.patchMention(entryId, mentionId, (cur) => editMention(cur, text));
+    if (m) this.toast('Texte modifié.', 'success');
+    return !!m;
+  }
+
+  /** Retire un rattachement (ou ignore une proposition) : gardé, grisé, avec « Rétablir ». */
+  async dismissMention(entryId: string, mentionId: string): Promise<boolean> {
+    const before: { status?: DayMention['status'] } = {};
+    const m = await this.patchMention(entryId, mentionId, (cur) => {
+      before.status = cur.status;
+      return cur.status === 'dismissed' ? null : { ...cur, status: 'dismissed' };
+    });
+    if (m) this.toast(before.status === 'proposed' ? 'Ce ne sera rattaché à aucun jour.' : 'Retiré de ce jour.', 'info');
+    return !!m;
+  }
+
+  /** Rétablit un rattachement retiré. */
+  async restoreMention(entryId: string, mentionId: string): Promise<boolean> {
+    const m = await this.patchMention(entryId, mentionId, (cur) =>
+      cur.status === 'dismissed' ? restoreMention(cur) : null,
+    );
+    if (m) this.toast('Rétabli.', 'success');
+    return !!m;
   }
 
   /* ================================================================== */

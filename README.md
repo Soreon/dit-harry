@@ -17,6 +17,13 @@ dans **mon** Google Drive, l'IA de **Google Gemini** avec **ma** clé.
 - **Correction** de la transcription à la main, puis nouvelle analyse automatique.
 - **Synthèse du jour** générée automatiquement à la première ouverture du lendemain
   (ou tout de suite avec « Générer maintenant »).
+- **Rattacher aux autres jours** : ce que je raconte d'un autre jour (« avant-hier j'ai dîné avec
+  Paul », « demain je vais chez le dentiste ») apparaît aussi sur ce jour-là, en « Ajouté plus
+  tard » ou en « 📌 Prévu » (aussi sur l'écran du jour même et dans « À venir » du Journal).
+  Rattaché d'office quand le repère est sans ambiguïté ; sinon je choisis le jour d'une touche.
+  Une touche sur la note ouvre le jour où je l'ai dite, et inversement. La synthèse du jour visé
+  l'intègre une fois, le lendemain, sans jamais présenter une chose prévue comme arrivée.
+  Désactivable dans les réglages (rien n'est alors envoyé à Gemini pour cela).
 - **Journal** : bande d'humeur des 30 derniers jours, liste des journées, détail de chaque jour.
 - **Hors ligne** : on peut enregistrer sans réseau ; tout part dès que la connexion revient.
 - **Sauvegarde** double : copie Markdown automatique et lisible dans un dossier Drive

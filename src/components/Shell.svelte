@@ -78,6 +78,8 @@
    */
   function focusScreenTitle(): void {
     if (document.querySelector('dialog[open]')) return;
+    // Arrivée sur un jour avec un élément mis en évidence (`#/jour/…?e=…`) : il garde le focus.
+    if (document.querySelector('[data-route-focus]')) return;
     const active = document.activeElement;
     // Un écran qui a placé lui-même le focus dans un champ le garde.
     if (active instanceof HTMLElement && active.isConnected && active.matches('input, textarea, select, [contenteditable="true"]')) {
@@ -113,7 +115,7 @@
           <JournalScreen />
         {:else if route.name === 'day'}
           {#key route.day}
-            <DayScreen day={route.day} />
+            <DayScreen day={route.day} focusEntry={route.entry} focusMention={route.mention} />
           {/key}
         {:else if route.name === 'entry'}
           {#key route.id}

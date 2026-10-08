@@ -1,12 +1,15 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { useApp } from '../lib/app.svelte';
+  import { activeMentions } from '../lib/mentions';
   import AudioPlayer from './AudioPlayer.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import EntryMentions from './EntryMentions.svelte';
   import {
     entryStatus,
     entryTitle,
     formatDayHeading,
+    formatDayLong,
     formatDuration,
     formatRelative,
     formatTime,
@@ -25,6 +28,14 @@
   const status = $derived(entry ? entryStatus(entry, app.syncStatus) : null);
   const backTarget = $derived(entry && entry.day !== app.today ? hrefDay(entry.day) : '#/');
   const canEdit = $derived(!!entry && (entry.source === 'text' || entry.transcript.trim() !== ''));
+  /** Message de suppression : les rattachements à d'autres jours disparaissent avec l'entrée. */
+  const deleteMessage = $derived.by(() => {
+    const base = "Elle sera effacée de ce téléphone et de ton Google Drive, audio compris. C'est définitif.";
+    const days = entry && app.dayLinksOn ? [...new Set(activeMentions(entry).map((m) => m.day))].sort() : [];
+    if (days.length === 0) return base;
+    const list = days.map((d) => formatDayLong(d, app.today)).join(', ');
+    return `${base} Ses ajouts à d'autres jours (${list}) disparaîtront aussi.`;
+  });
 
   let editing = $state(false);
   let draft = $state('');
@@ -202,6 +213,7 @@
           </ul>
         </section>
       {/if}
+      <EntryMentions {entry} />
       {#if entry.analyzedAt}
         <p class="muted small">
           Analysée {formatRelative(entry.analyzedAt, app.now)}{entry.analysisModel ? ` avec ${entry.analysisModel}` : ''}.
@@ -218,7 +230,7 @@
     <ConfirmDialog
       bind:open={confirmDelete}
       title="Supprimer cette entrée ?"
-      message="Elle sera effacée de ce téléphone et de ton Google Drive, audio compris. C'est définitif."
+      message={deleteMessage}
       confirmLabel="Supprimer"
       danger
       onconfirm={remove}

@@ -16,6 +16,8 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze({
   // L'utilisateur a choisi « les deux » sauvegardes : copie visible activée par défaut.
   mirrorEnabled: true,
   audioRetentionDays: config.defaultAudioRetentionDays,
+  // « Rattacher aux autres jours » : automatique par défaut (SPEC §16).
+  dayLinks: 'auto',
   updatedAt: '1970-01-01T00:00:00.000Z',
 });
 
@@ -47,6 +49,7 @@ export function normalizeSettings(raw: unknown): Settings {
     mirrorEnabled: typeof r.mirrorEnabled === 'boolean' ? r.mirrorEnabled : DEFAULT_SETTINGS.mirrorEnabled,
     audioRetentionDays:
       Number.isFinite(days) && days >= 1 ? Math.round(days) : DEFAULT_SETTINGS.audioRetentionDays,
+    dayLinks: r.dayLinks === 'off' ? 'off' : 'auto',
     updatedAt: isIsoDate(r.updatedAt) ? r.updatedAt : DEFAULT_SETTINGS.updatedAt,
   };
 }

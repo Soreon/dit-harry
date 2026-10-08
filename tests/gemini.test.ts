@@ -3,14 +3,19 @@ import { AppError } from '../src/lib/errors';
 import { MAX_INLINE_AUDIO_BYTES, createGeminiClient, msUntilDailyQuotaReset } from '../src/lib/gemini';
 import {
   ENTRY_AUDIO_PROMPT,
+  ENTRY_AUDIO_PROMPT_WITH_MENTIONS,
   ENTRY_AUDIO_SCHEMA,
+  ENTRY_AUDIO_SCHEMA_WITH_MENTIONS,
   ENTRY_TEXT_PROMPT,
+  ENTRY_TEXT_PROMPT_WITH_MENTIONS,
   ENTRY_TEXT_SCHEMA,
+  ENTRY_TEXT_SCHEMA_WITH_MENTIONS,
   SYNTHESIS_PROMPT,
   SYNTHESIS_SCHEMA,
+  SYNTHESIS_SCHEMA_WITH_ADDITIONS,
   SYSTEM_INSTRUCTION,
 } from '../src/lib/prompts';
-import type { Entry, EntryContext } from '../src/lib/types';
+import type { DayLink, Entry, EntryContext } from '../src/lib/types';
 import { formatDayFr } from '../src/lib/util';
 
 /* ------------------------------------------------------------------ */
@@ -696,5 +701,103 @@ describe('createGeminiClient — checkKey', () => {
     const { fetchImpl } = fakeFetch(new TypeError('Failed to fetch'));
     const err = await caught(createGeminiClient({ apiKey: KEY, model: MODEL, fetchImpl }).checkKey());
     expect(err.kind).toBe('network');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Mentions d'autres jours                                             */
+/* ------------------------------------------------------------------ */
+
+describe('createGeminiClient — mentions d’autres jours', () => {
+  const AUTO: EntryContext = { ...CTX, dayLinks: 'auto' };
+  const OFF: EntryContext = { ...CTX, dayLinks: 'off' };
+
+  it('détection active : consigne, repères et schéma avec `mentions` ; mentions validées', async () => {
+    const { fetchImpl, calls } = fakeFetch(
+      okModel({
+        ...ANALYSIS,
+        mentions: [
+          { when: 'avant-hier', date: '2026-10-06', text: "J'ai dîné avec Paul." },
+          { when: 'samedi', date: '', text: 'Inventé : absent du texte.' },
+        ],
+      }),
+    );
+    const ai = createGeminiClient({ apiKey: KEY, model: MODEL, fetchImpl });
+    const res = await ai.analyzeText("Avant-hier j'ai dîné avec Paul.", AUTO);
+    expect(res.mentions).toEqual([
+      expect.objectContaining({ day: '2026-10-06', kind: 'past', status: 'auto', when: 'avant-hier' }),
+    ]);
+    const body = bodyOf(calls[0]);
+    const text = body.contents[0]?.parts[0]?.text ?? '';
+    expect(text.startsWith(ENTRY_TEXT_PROMPT_WITH_MENTIONS)).toBe(true);
+    expect(text).toContain('Repères : jours passés : jeudi 1 octobre, vendredi 2,');
+    expect(text).toContain('mardi 6 (avant-hier), mercredi 7 (hier) ; jours à venir : vendredi 9 octobre (demain)');
+    expect(body.generationConfig).toEqual({
+      responseFormat: { text: { mimeType: 'APPLICATION_JSON', schema: ENTRY_TEXT_SCHEMA_WITH_MENTIONS } },
+    });
+  });
+
+  it('audio : mentions ancrées dans la transcription renvoyée', async () => {
+    const { fetchImpl, calls } = fakeFetch(
+      okModel({
+        transcript: 'Demain je vais chez le dentiste.',
+        ...ANALYSIS,
+        mentions: [{ when: 'demain', date: '2026-10-09', text: 'Je vais chez le dentiste.' }],
+      }),
+    );
+    const ai = createGeminiClient({ apiKey: KEY, model: MODEL, fetchImpl });
+    const res = await ai.analyzeAudio(new Blob([new Uint8Array([1])], { type: 'audio/webm' }), 'audio/webm', AUTO);
+    expect(res.analysis.mentions?.[0]).toMatchObject({ day: '2026-10-09', kind: 'future', status: 'auto' });
+    expect(bodyOf(calls[0]).generationConfig).toEqual({
+      responseFormat: { text: { mimeType: 'APPLICATION_JSON', schema: ENTRY_AUDIO_SCHEMA_WITH_MENTIONS } },
+    });
+    expect(bodyOf(calls[0]).contents[0]?.parts[1]?.text?.startsWith(ENTRY_AUDIO_PROMPT_WITH_MENTIONS)).toBe(true);
+  });
+
+  it('désactivée : requête identique à celle d’avant (0 token de plus), champ ignoré', async () => {
+    const reply = () => okModel({ ...ANALYSIS, mentions: [{ when: 'hier', date: '', text: 'x' }] });
+    const { fetchImpl, calls } = fakeFetch(reply(), reply());
+    const ai = createGeminiClient({ apiKey: KEY, model: MODEL, fetchImpl });
+    const off = await ai.analyzeText('Hier, x.', OFF);
+    await ai.analyzeText('Hier, x.', CTX);
+    expect(off).toEqual(ANALYSIS);
+    expect(String(calls[0]?.init.body)).toBe(String(calls[1]?.init.body));
+    expect(String(calls[0]?.init.body)).not.toContain('mentions');
+    expect(String(calls[0]?.init.body)).not.toContain('Repères');
+  });
+
+  it('synthèse sans note : requête inchangée ; avec des notes : section [A…]/[P…], schéma `additions`, verdicts', async () => {
+    const synth = {
+      summary: 'Journée.',
+      mood: { score: 1, label: 'bien' },
+      highlights: ['Dîner'],
+      themes: ['amis'],
+      todos: [],
+    };
+    const { fetchImpl, calls } = fakeFetch(
+      okModel(synth),
+      okModel(synth),
+      okModel({ ...synth, additions: [{ ref: 'A1', status: 'deja' }, { ref: 'A7', status: 'nouveau' }] }),
+    );
+    const ai = createGeminiClient({ apiKey: KEY, model: 'gemini-3.8-flash', thinkingLevel: 'low', fetchImpl });
+    const entries = [entry({ id: 'a', createdAt: new Date(2026, 9, 6, 19, 0).toISOString(), transcript: 'Dîner avec Paul.' })];
+    const link: DayLink = {
+      entryId: 'src',
+      sourceDay: '2026-10-08',
+      sourceCreatedAt: new Date(2026, 9, 8, 7, 42).toISOString(),
+      mention: { id: 'm1', kind: 'past', day: '2026-10-06', when: 'avant-hier', text: "J'ai dîné avec Paul.", status: 'auto' },
+      ref: 'src/m1',
+    };
+    const plain = await ai.synthesizeDay('2026-10-06', entries);
+    await ai.synthesizeDay('2026-10-06', entries, []);
+    expect(plain).toEqual(synth);
+    expect(String(calls[1]?.init.body)).toBe(String(calls[0]?.init.body));
+
+    const res = await ai.synthesizeDay('2026-10-06', entries, [link]);
+    expect(res.mentionVerdicts).toEqual({ 'src/m1': 'deja' });
+    const body = bodyOf(calls[2]);
+    expect(body.generationConfig.responseFormat?.text.schema).toEqual(SYNTHESIS_SCHEMA_WITH_ADDITIONS);
+    const text = body.contents[0]?.parts[0]?.text ?? '';
+    expect(text).toContain('[A1] (dit le jeudi 8 octobre 2026 à 07:42, « avant-hier ») J\'ai dîné avec Paul.');
   });
 });

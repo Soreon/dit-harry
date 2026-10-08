@@ -2,19 +2,29 @@
  * Fonctions pures de l'interface : routage hash, regroupement par jour, humeur,
  * libellés et formats de date. Aucune dépendance aux services → testables seules.
  */
-import type { DayKey, LocalEntry, LocalSynthesis, Mood, SyncStatus } from '../lib/types';
+import type { DayKey, DayLink, LocalEntry, LocalSynthesis, Mood, SyncStatus } from '../lib/types';
 import { addDays, parseDayKey, timeHHmm } from '../lib/util';
 
 /* ------------------------------------------------------------------ */
 /* Routage                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * `#/jour/<jour>?e=<entrée>[&m=<mention>]` : la page du jour met en évidence (défilement, focus)
+ * l'entrée `e`, ou la note de l'entrée `e` rattachée à ce jour (`m`).
+ */
 export type Route =
   | { name: 'today' }
   | { name: 'journal' }
-  | { name: 'day'; day: DayKey }
+  | { name: 'day'; day: DayKey; entry?: string; mention?: string }
   | { name: 'entry'; id: string }
   | { name: 'settings' };
+
+/** Élément à mettre en évidence en arrivant sur un jour. */
+export interface DayFocus {
+  entry: string;
+  mention?: string;
+}
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -34,7 +44,10 @@ function safeDecode(s: string): string {
 
 /** '#/jour/2026-10-08' → { name: 'day', day: '2026-10-08' } ; inconnu → Aujourd'hui. */
 export function parseRoute(hash: string): Route {
-  const path = hash.replace(/^#/, '').replace(/^\/+/, '').replace(/\/+$/, '');
+  const raw = hash.replace(/^#/, '');
+  const q = raw.indexOf('?');
+  const path = (q >= 0 ? raw.slice(0, q) : raw).replace(/^\/+/, '').replace(/\/+$/, '');
+  const query = new URLSearchParams(q >= 0 ? raw.slice(q + 1) : '');
   const [head = '', ...rest] = path.split('/');
   const arg = rest.join('/');
   switch (head) {
@@ -42,13 +55,29 @@ export function parseRoute(hash: string): Route {
       return { name: 'journal' };
     case 'reglages':
       return { name: 'settings' };
-    case 'jour':
-      return isValidDay(arg) ? { name: 'day', day: arg } : { name: 'journal' };
+    case 'jour': {
+      if (!isValidDay(arg)) return { name: 'journal' };
+      const route: Route = { name: 'day', day: arg };
+      const entry = query.get('e');
+      const mention = query.get('m');
+      if (entry) {
+        route.entry = entry;
+        if (mention) route.mention = mention;
+      }
+      return route;
+    }
     case 'entree':
       return arg ? { name: 'entry', id: safeDecode(arg) } : { name: 'today' };
     default:
       return { name: 'today' };
   }
+}
+
+/** Même écran (les paramètres de mise en évidence d'un jour sont ignorés) ? */
+export function sameScreen(a: Route, b: Route): boolean {
+  if (a.name === 'day' && b.name === 'day') return a.day === b.day;
+  if (a.name === 'entry' && b.name === 'entry') return a.id === b.id;
+  return a.name === b.name;
 }
 
 export function routeHash(route: Route): string {
@@ -60,14 +89,18 @@ export function routeHash(route: Route): string {
     case 'settings':
       return '#/reglages';
     case 'day':
-      return hrefDay(route.day);
+      return hrefDay(route.day, route.entry ? { entry: route.entry, mention: route.mention } : undefined);
     case 'entry':
       return hrefEntry(route.id);
   }
 }
 
-export function hrefDay(day: DayKey): string {
-  return `#/jour/${day}`;
+/** Page d'un jour ; `focus` : entrée (ou note d'une entrée) à mettre en évidence. */
+export function hrefDay(day: DayKey, focus?: DayFocus): string {
+  if (!focus) return `#/jour/${day}`;
+  const q = new URLSearchParams({ e: focus.entry });
+  if (focus.mention) q.set('m', focus.mention);
+  return `#/jour/${day}?${q.toString()}`;
 }
 
 export function hrefEntry(id: string): string {
@@ -113,27 +146,31 @@ export interface DayGroup {
   /** Ordre chronologique (matin → soir). */
   entries: LocalEntry[];
   synthesis?: LocalSynthesis;
+  /** Notes d'autres jours qui visent ce jour (dans l'ordre où elles ont été dites) ; absent si aucune. */
+  links?: DayLink[];
 }
 
-/** Jours (récent → ancien) ; entrées de chaque jour dans l'ordre chronologique. */
+/**
+ * Jours (récent → ancien, y compris ceux à venir qui ont des choses prévues) ; entrées de chaque
+ * jour dans l'ordre chronologique.
+ */
 export function groupDays(
   entries: readonly LocalEntry[],
   syntheses: Readonly<Record<DayKey, LocalSynthesis>>,
+  links?: ReadonlyMap<DayKey, DayLink[]>,
 ): DayGroup[] {
   const map = new Map<DayKey, DayGroup>();
-  for (const e of entries) {
-    let g = map.get(e.day);
+  const groupOf = (day: DayKey): DayGroup => {
+    let g = map.get(day);
     if (!g) {
-      g = { day: e.day, entries: [] };
-      map.set(e.day, g);
+      g = { day, entries: [] };
+      map.set(day, g);
     }
-    g.entries.push(e);
-  }
-  for (const s of Object.values(syntheses)) {
-    const g = map.get(s.day);
-    if (g) g.synthesis = s;
-    else map.set(s.day, { day: s.day, entries: [], synthesis: s });
-  }
+    return g;
+  };
+  for (const e of entries) groupOf(e.day).entries.push(e);
+  for (const s of Object.values(syntheses)) groupOf(s.day).synthesis = s;
+  for (const [day, list] of links ?? []) if (list.length > 0) groupOf(day).links = list;
   const groups = [...map.values()];
   for (const g of groups) {
     g.entries.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
@@ -254,11 +291,39 @@ export function formatDayHeading(day: DayKey, today: DayKey): string {
   return capitalize((sameYear ? fmtWeekdayDayMonth : fmtFull).format(d));
 }
 
-/** « Aujourd'hui », « Hier », sinon « Lundi 5 octobre ». */
+/** « Aujourd'hui », « Hier », « Demain », sinon « Lundi 5 octobre ». */
 export function relativeDayLabel(day: DayKey, today: DayKey): string {
   if (day === today) return "Aujourd'hui";
   if (day === addDays(today, -1)) return 'Hier';
+  if (day === addDays(today, 1)) return 'Demain';
   return formatDayHeading(day, today);
+}
+
+/** « mardi 6 octobre » (année ajoutée si différente de celle de `today`), en minuscules. */
+export function formatDayLong(day: DayKey, today: DayKey): string {
+  const d = parseDayKey(day);
+  return (day.slice(0, 4) === today.slice(0, 4) ? fmtWeekdayDayMonth : fmtFull).format(d);
+}
+
+const fmtShortDay = new Intl.DateTimeFormat('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
+
+/** « Mar. 6 oct. » (choix d'un jour, pastilles). */
+export function formatDayShort(day: DayKey): string {
+  return capitalize(fmtShortDay.format(parseDayKey(day)));
+}
+
+/** « aujourd'hui à 07:42 », « hier à 21:04 », « le jeudi 8 octobre à 07:42 » : quand une entrée a été dite. */
+export function saidAt(day: DayKey, createdAt: string, today: DayKey): string {
+  const time = formatTime(createdAt);
+  const at = time ? ` à ${time}` : '';
+  if (day === today) return `aujourd'hui${at}`;
+  if (day === addDays(today, -1)) return `hier${at}`;
+  return `le ${formatDayLong(day, today)}${at}`;
+}
+
+/** Notes d'un jour d'un genre donné (« Ajouté plus tard » : past ; « Prévu » : future). */
+export function linksOfKind(links: readonly DayLink[] | undefined, kind: 'past' | 'future'): DayLink[] {
+  return (links ?? []).filter((l) => l.mention.kind === kind);
 }
 
 /** « Octobre 2026 » */
