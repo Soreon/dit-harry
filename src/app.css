@@ -1,0 +1,569 @@
+/*
+ * Dit Harry — styles globaux.
+ * Ambiance : carnet de papier crème, encre brun-noir, accent terracotta.
+ * Toutes les couleurs sont des variables ; le thème sombre les redéfinit.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Papier et encre */
+  --bg: #f6f1e9;
+  --surface: #fcf9f4;
+  --surface-sunk: #efe7da;
+  --ink: #2b2622;
+  --ink-muted: #6b6057;
+  --ink-faint: #8f8378;
+  --line: #e4d9c9;
+  --line-strong: #d3c5b1;
+
+  /* Accent terracotta : --accent pour les grandes surfaces (bouton d'enregistrement),
+     --accent-strong pour le texte et les boutons (contraste AA sur le papier). */
+  --accent: #c8553d;
+  --accent-strong: #a9442f;
+  --accent-soft: #f4ddd3;
+  --on-accent: #ffffff;
+
+  /* États */
+  --success: #3f6849;
+  --success-soft: #dde8dc;
+  --warning: #845510;
+  --warning-soft: #f5e6c6;
+  --danger: #b03a2e;
+  --danger-soft: #f6dcd6;
+  --focus-ring: #a9442f;
+  --knob: #ffffff;
+
+  /* Humeur (échelle divergente : bleu ardoise → sable → ocre) */
+  --mood-n2: #4a679c;
+  --mood-n1: #8aa3cf;
+  --mood-0: #c9c0b2;
+  --mood-p1: #e5a33a;
+  --mood-p2: #b5730c;
+
+  --shadow-sm: 0 1px 2px rgb(43 38 34 / 0.06), 0 2px 8px rgb(43 38 34 / 0.04);
+  --shadow: 0 2px 4px rgb(43 38 34 / 0.06), 0 10px 30px rgb(43 38 34 / 0.08);
+  --scrim: rgb(43 38 34 / 0.38);
+
+  --font-serif: ui-serif, 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+
+  --radius-lg: 22px;
+  --radius: 16px;
+  --radius-sm: 10px;
+  --radius-pill: 999px;
+
+  --tabbar-h: 64px;
+  --content-max: 560px;
+  --gutter: 16px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --bg: #1c1915;
+    --surface: #26221d;
+    --surface-sunk: #151310;
+    --ink: #f1e9dc;
+    --ink-muted: #b8ab9a;
+    --ink-faint: #8c8072;
+    --line: #3a342c;
+    --line-strong: #4d453a;
+
+    --accent: #e07a5f;
+    --accent-strong: #ec8c71;
+    --accent-soft: #4a2a21;
+    --on-accent: #1c1915;
+
+    --success: #93c39b;
+    --success-soft: #233528;
+    --warning: #e9bb66;
+    --warning-soft: #3b2d14;
+    --danger: #f29483;
+    --danger-soft: #47231e;
+    --focus-ring: #ec8c71;
+    --knob: #f1e9dc;
+
+    --mood-n2: #9db7e6;
+    --mood-n1: #5f7aab;
+    --mood-0: #6b6358;
+    --mood-p1: #b88a35;
+    --mood-p2: #f0c066;
+
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.3);
+    --shadow: 0 2px 6px rgb(0 0 0 / 0.35), 0 12px 32px rgb(0 0 0 / 0.3);
+    --scrim: rgb(0 0 0 / 0.55);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Base                                                                */
+/* ------------------------------------------------------------------ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overflow-x: hidden;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+h1 {
+  font-size: 1.75rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+}
+
+h3 {
+  font-size: 1.05rem;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--accent-strong);
+  text-underline-offset: 3px;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Mise en page                                                        */
+/* ------------------------------------------------------------------ */
+
+.screen {
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: 20px calc(var(--gutter) + var(--safe-right)) 32px calc(var(--gutter) + var(--safe-left));
+}
+
+.screen-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.kicker {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.muted {
+  color: var(--ink-muted);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cartes                                                              */
+/* ------------------------------------------------------------------ */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 16px;
+}
+
+.section-title {
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  margin: 0 0 8px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Boutons                                                             */
+/* ------------------------------------------------------------------ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  background: transparent;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  line-height: 1.2;
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.1s ease;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+}
+
+.btn-primary {
+  background: var(--accent-strong);
+  color: var(--on-accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-strong) 88%, var(--ink));
+}
+
+.btn-secondary {
+  background: var(--surface);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--surface-sunk);
+}
+
+.btn-ghost {
+  color: var(--accent-strong);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.btn-danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.btn-danger-solid {
+  background: var(--danger);
+  color: var(--on-accent);
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.btn-small {
+  min-height: 36px;
+  padding: 0 14px;
+  font-size: 0.875rem;
+}
+
+/* Bouton icône rond (retour, fermer…) — cible 44 px */
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.icon-btn:hover {
+  background: var(--surface-sunk);
+}
+
+/* ------------------------------------------------------------------ */
+/* Pastilles                                                           */
+/* ------------------------------------------------------------------ */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunk);
+  color: var(--ink-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.chip-pending,
+.chip-unsent {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.chip-analyzing {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.chip-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.chip-ok {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.tag {
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunk);
+  border: 1px solid var(--line);
+  font-size: 0.875rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* Champs                                                              */
+/* ------------------------------------------------------------------ */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-weight: 600;
+  font-size: 0.9375rem;
+}
+
+.field-help {
+  font-size: 0.875rem;
+  color: var(--ink-muted);
+}
+
+.input,
+.textarea {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.input:focus-visible,
+.textarea:focus-visible {
+  outline-width: 2px;
+  outline-offset: 0;
+  border-color: var(--accent-strong);
+}
+
+.textarea {
+  resize: vertical;
+  font-size: 17px;
+  line-height: 1.6;
+}
+
+/* Texte de lecture (transcriptions) */
+.prose {
+  font-size: 17px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.prose p + p {
+  margin-top: 0.85em;
+}
+
+/* Lien qui couvre toute sa carte (les boutons internes restent cliquables) */
+.stretched-link::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+
+/* ------------------------------------------------------------------ */
+/* Messages                                                            */
+/* ------------------------------------------------------------------ */
+
+.notice {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunk);
+  font-size: 0.9375rem;
+}
+
+.notice-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.notice-warning {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.notice-success {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+/* Indicateur d'activité */
+.spinner {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  flex: none;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Dialogues natifs                                                    */
+/* ------------------------------------------------------------------ */
+
+dialog {
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 0;
+  width: min(100% - 32px, 440px);
+  max-height: calc(100dvh - 32px);
+}
+
+dialog::backdrop {
+  background: var(--scrim);
+}
+
+/* ------------------------------------------------------------------ */
+/* Mouvement réduit                                                    */
+/* ------------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .spinner {
+    animation: none;
+    border-right-color: currentColor;
+    opacity: 0.6;
+  }
+}

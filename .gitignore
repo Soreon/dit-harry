@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env.local
+.env.*.local
+*.log
+.DS_Store
+coverage/
+
+# Réglages locaux (contiennent des infos machine/réseau — ne jamais publier)
+.claude/
+.vscode/
+.vitest/
+
+# Secrets Google téléchargés depuis la console — jamais dans le dépôt
+client_secret*.json
+*.pem
+*.key

@@ -1,0 +1,88 @@
+# Construit Dit Harry et le publie sur GitHub Pages à chaque push sur main.
+# Actions épinglées par SHA de commit (le commentaire indique la version correspondante).
+name: Déployer sur GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Par défaut : lecture seule. Les droits Pages/OIDC ne sont donnés qu'au job de déploiement.
+permissions:
+  contents: read
+
+# Un seul déploiement à la fois ; on n'interrompt pas un déploiement en cours.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: read # configure-pages lit la configuration du site (base_path)
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installer Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Configurer Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Vérifier la variable GOOGLE_CLIENT_ID
+        if: ${{ vars.GOOGLE_CLIENT_ID == '' }}
+        run: echo "::warning::Variable de dépôt GOOGLE_CLIENT_ID absente — la connexion Google ne fonctionnera pas (voir docs/SETUP.md)."
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Tests
+        run: npm test
+
+      - name: Vérification des types
+        run: npm run check
+
+      - name: Construire
+        run: npm run build
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
+
+      # Chaque déploiement change sw.js : le navigateur installe le nouveau service worker,
+      # qui supprime les anciens caches.
+      - name: Numéroter le service worker
+        run: |
+          grep -q '__DIT_HARRY_BUILD_ID__' dist/sw.js
+          sed -i "s/__DIT_HARRY_BUILD_ID__/${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}/" dist/sw.js
+          grep -o "const BUILD_ID = '[^']*'" dist/sw.js
+
+      - name: Envoyer le site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publier sur GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
